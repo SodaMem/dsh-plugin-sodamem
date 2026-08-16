@@ -5,6 +5,19 @@ The extractor is the only thing that needs a model, and `ScriptedProvider`
 full ingest path runs for real (fact rows, source spans, entities, embeddings
 via the cached MiniLM) without an API key.
 
+PRECONDITION — this is the one script in this repo that is NOT self-contained.
+It imports the `sodamem` PYTHON package (including internals:
+`sodamem.llm.testing`, `sodamem.memory.ingest.extractor`). This repo is a
+TypeScript package; `npm install` does not and cannot provide those. To run
+this script you need the SodaMem Python package installed and importable:
+
+    git clone https://github.com/SodaMem/SodaMem
+    cd SodaMem && pip install -e ".[dev,chroma,server,llm]"
+
+It is kept here because it is what makes the numbers in NOTES-latency.md
+reproducible. The two `.mjs` scripts beside it have no such dependency — they
+speak plain HTTP to a running daemon and need only Node.
+
 Usage: python populate_store.py <data_root> <user_id> <n_facts>
 """
 import json

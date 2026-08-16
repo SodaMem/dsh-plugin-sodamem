@@ -1,0 +1,21 @@
+name: ci
+on:
+  push: { branches: [main] }
+  pull_request: { branches: [main] }
+
+jobs:
+  build:
+    # `tsc` is the part that matters most: vitest does not typecheck, so a
+    # plugin built against the wrong peer major passes its tests and still
+    # fails to build. Typecheck, test, then build — in that order.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22" # the harness requires it; the plugin uses AbortSignal.any
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test # no live daemon needed; HTTP is mocked at the fetch boundary
+      - run: npm run build

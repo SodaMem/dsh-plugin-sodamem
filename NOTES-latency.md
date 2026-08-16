@@ -1,7 +1,13 @@
-# AC7 — measured `GET /v1/context` latency
+# Measured `GET /v1/context` latency
+
+*(Originally written as acceptance criterion AC7 of [SodaMem
+#9](https://github.com/SodaMem/SodaMem/issues/9), the issue this plugin was
+built under. "AC7" below refers to that.)*
 
 Recall sits on the synchronous path between the user pressing enter and the
-first token, and the daemon runs `--workers 1` by design (ADR 0001 §2). So the
+first token, and the SodaMem daemon runs `--workers 1` by design ([SodaMem ADR
+0001 §2](https://github.com/SodaMem/SodaMem/blob/main/docs/adr/0001-control-plane-db.md)
+— single worker is a correctness constraint there, not a performance choice). So the
 1500 ms recall deadline is set from a measurement, not a hope.
 
 **Every number in this file was produced by a run against a live daemon backed
@@ -19,6 +25,16 @@ feeds `FactEventExtractorV2` a pre-set response per call, which drives the
 real MiniLM embeddings from the cached model — with **zero LLM network calls**.
 
 Build script: `scripts/populate_store.py <data_root> <user_id> <n_facts>`.
+
+**Precondition.** That script is Python and imports `sodamem` internals
+(`sodamem.llm.testing.ScriptedProvider`, `sodamem.memory.ingest.extractor`).
+This repo is a TypeScript package and does not ship or install it, so
+`populate_store.py` cannot run from a bare checkout of this repo. Reproducing
+the store — and therefore the measurement — requires a
+[SodaMem](https://github.com/SodaMem/SodaMem) checkout with the Python package
+installed (`pip install -e ".[dev,chroma,server,llm]"`). The two `.mjs` probe
+scripts have no such dependency: they speak plain HTTP to a running daemon and
+run on Node alone.
 
 Resulting store:
 
@@ -150,7 +166,9 @@ turn (`ctx.logger.warn`) even though it never raises.
 ## The concurrency ceiling is not a plugin defect
 
 The read path not scaling past a handful of concurrent clients is a **SodaMem
-daemon property**: one worker by design (ADR 0001 §2), pre-existing, and
+daemon property**: one worker by design ([SodaMem ADR 0001
+§2](https://github.com/SodaMem/SodaMem/blob/main/docs/adr/0001-control-plane-db.md)),
+pre-existing, and
 entirely independent of this plugin.
 
 What this plugin changes is **reachability**. Over the MCP bridge, `/v1/context`
@@ -160,14 +178,23 @@ was previously hard to reach is now reached by ordinary use with a few clients
 attached.
 
 That deserves its own issue against the daemon's read concurrency. It is
-**explicitly out of scope for #9** — this plugin's job is to degrade safely
+**explicitly out of scope for [SodaMem
+#9](https://github.com/SodaMem/SodaMem/issues/9)**, the issue this plugin was
+built under — this plugin's job is to degrade safely
 when the ceiling is hit, which it does and which is tested.
 
 ## Reproducing
 
+All four scripts live in this repo, under `scripts/`, and the commands below
+are written from this repo's root. Step 1 additionally needs the `sodamem`
+**Python** package importable — install it from a
+[SodaMem](https://github.com/SodaMem/SodaMem) checkout first (see the
+precondition above). Steps 2–4 need only Node and a reachable daemon.
+
 ```sh
 # 1. Build a real store, no LLM key needed.
-python dsh-plugin/scripts/populate_store.py <data_root> <user_id> 1000
+#    Requires the sodamem Python package on sys.path.
+python scripts/populate_store.py <data_root> <user_id> 1000
 
 # 2. Start the daemon on that store.
 sodamem daemon ensure --api-url http://127.0.0.1:8771 \
@@ -176,9 +203,9 @@ sodamem daemon ensure --api-url http://127.0.0.1:8771 \
 # 3. Sequential latency.
 SODAMEM_API_URL=http://127.0.0.1:8771 SODAMEM_API_KEY=<key> \
 SODAMEM_USER_ID=<user_id> SODAMEM_QUERIES='where do I live?|where do I work now?' \
-  node dsh-plugin/scripts/measure-context-latency.mjs 200
+  node scripts/measure-context-latency.mjs 200
 
 # 4. Concurrency shape.
 SODAMEM_API_URL=http://127.0.0.1:8771 SODAMEM_API_KEY=<key> \
-SODAMEM_USER_ID=<user_id> node dsh-plugin/scripts/concurrency_probe.mjs
+SODAMEM_USER_ID=<user_id> node scripts/concurrency_probe.mjs
 ```

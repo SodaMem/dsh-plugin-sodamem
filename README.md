@@ -1,6 +1,10 @@
 # dsh-plugin-sodamem
 
-SodaMem as a **memory layer** for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`), not as a tool in the model's tool bag.
+A standalone plugin for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) that wires in [SodaMem](https://github.com/SodaMem/SodaMem) as a persistent memory layer.
+
+**New here?** SodaMem is an open-source long-term memory store for LLM agents: you ingest conversation turns into it and it extracts durable facts, then serves a prompt-ready evidence block back on demand. It runs as a local daemon. This repo is only the `dsh` plugin — the memory engine itself lives at [github.com/SodaMem/SodaMem](https://github.com/SodaMem/SodaMem), and you need it running for this plugin to do anything.
+
+The plugin installs SodaMem as a **memory layer**, not as a tool in the model's tool bag.
 
 - **Recall** — before every turn, the plugin fetches a prompt-ready evidence block from SodaMem and contributes it to the system prompt.
 - **Retain** — when every turn closes, the plugin ingests that turn's messages back into SodaMem.
@@ -9,7 +13,7 @@ Neither one is a tool call, so neither one depends on the model deciding to use 
 
 ## Why not the MCP bridge?
 
-SodaMem already has an MCP integration for `dsh` ([`integrations/deepseek-harness/`](../integrations/deepseek-harness/README.md)). It exposes memory as **tools**, which means the model has to choose to call them — and on most turns it simply doesn't. The strongest thing SodaMem offers, the zero-LLM `GET /v1/context` evidence block, ends up left to the model's discretion.
+SodaMem already has an MCP integration for `dsh`, in the main SodaMem repo ([`integrations/deepseek-harness/`](https://github.com/SodaMem/SodaMem/tree/main/integrations/deepseek-harness)). It exposes memory as **tools**, which means the model has to choose to call them — and on most turns it simply doesn't. The strongest thing SodaMem offers, the zero-LLM `GET /v1/context` evidence block, ends up left to the model's discretion.
 
 MCP cannot fix that. A tool is pull-only, and nothing in the protocol lets a server contribute to the prompt or observe a turn closing. This plugin uses the two seams the harness itself exposes — `agent/pre-step` and `agent/turn-stopping` — so recall and retain happen unconditionally.
 
@@ -82,7 +86,7 @@ There is deliberately **no switch that turns recall or retain on or off**, and n
 
 The plugin talks HTTP to a daemon. It has no data-root option and imports nothing that can open a store locally, and that is a deliberate constraint rather than an unfinished feature.
 
-Two processes writing one `SODAMEM_DATA_ROOT` corrupt it (see `mcp_server/README.md` and ADR 0001 §2). A plugin loaded inside an arbitrary harness process is the worst possible candidate for being that second writer — you would not know how many of them are running. So there is exactly one writer, the daemon, and everyone else is a client.
+Two processes writing one `SODAMEM_DATA_ROOT` corrupt it — per-user SQLite without cross-process WAL is not safe under concurrent writers, which is why the daemon is pinned to a single worker (SodaMem [`mcp_server/README.md`](https://github.com/SodaMem/SodaMem/blob/main/mcp_server/README.md) and [ADR 0001 §2](https://github.com/SodaMem/SodaMem/blob/main/docs/adr/0001-control-plane-db.md)). A plugin loaded inside an arbitrary harness process is the worst possible candidate for being that second writer — you would not know how many of them are running. So there is exactly one writer, the daemon, and everyone else is a client.
 
 ## When SodaMem is down or slow
 
