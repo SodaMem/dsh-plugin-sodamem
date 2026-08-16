@@ -15,8 +15,11 @@ import {
   DAEMON_KEY,
   DAEMON_URL,
   DAEMON_USER,
+  PING_TOOL,
   bootRuntime,
   hasSodaMemEvidence,
+  textReply,
+  toolCallReply,
   type RecordingAdapter,
 } from "./runtime.js";
 import { startRecordingProxy, startStallingDaemon, type RunningServer } from "./servers.js";
@@ -28,10 +31,15 @@ const config = (apiUrl: string) => ({
   tokenBudget: 1200,
 });
 
-/** Distinctive store content, used to tell one turn's recall from another's. */
+/**
+ * Two questions whose answers in the bench store do not overlap. Telling one
+ * turn's recall from another's is the whole point of the recall tests, so a
+ * shared top hit would make them prove nothing.
+ */
 const PET_QUERY = "do I have a pet?";
 const PET_EVIDENCE = "golden retriever";
 const FLIGHT_QUERY = "which airline did I fly to Boston?";
+const FLIGHT_EVIDENCE = "flew United to Boston";
 
 async function adminRequestCount(route: string): Promise<number> {
   const url = new URL("/v1/admin/requests", DAEMON_URL);
@@ -46,11 +54,21 @@ function report(label: string, adapter: RecordingAdapter): void {
   const lines = adapter.seen.map(
     (call, i) =>
       `  request #${i}: ${call.messages.length} messages, sodamem evidence: ${
-        adapter.messageText(i).includes("evidence_id=") ? "YES" : "no"
+        adapter.evidenceText(i) === "" ? "no" : "YES"
       }`
   );
   // eslint-disable-next-line no-console
   console.log(`[${label}]\n${lines.join("\n")}`);
+}
+
+/** The first few evidence lines of one request, for the record. */
+function excerpt(adapter: RecordingAdapter, index: number, lines = 2): string {
+  return adapter
+    .evidenceText(index)
+    .split("\n")
+    .filter((line) => line.startsWith("- evidence_id="))
+    .slice(0, lines)
+    .join("\n");
 }
 
 beforeAll(async () => {
@@ -67,38 +85,70 @@ describe("recall reaches the model", () => {
     const runtime = await bootRuntime(config(DAEMON_URL));
     try {
       await runtime.ask(PET_QUERY);
-
-      const turnOne = runtime.adapter.messageText(0);
       report("recall / single turn", runtime.adapter);
       // eslint-disable-next-line no-console
-      console.log(`--- assembled request #0 ---\n${turnOne}\n---`);
+      console.log(`--- request #0 evidence ---\n${excerpt(runtime.adapter, 0)}\n---`);
 
       expect(runtime.adapter.seen.length).toBe(1);
-      expect(turnOne).toContain(PET_EVIDENCE);
+      expect(runtime.adapter.messageText(0)).toContain(PET_QUERY);
+      expect(runtime.adapter.topEvidence(0)).toContain(PET_EVIDENCE);
     } finally {
       await runtime.dispose();
     }
   }, 60_000);
 
-  it("documents WHERE the evidence actually lands (turn N+1, not turn N)", async () => {
+  it("answers each turn's own question, not the previous one", async () => {
     const runtime = await bootRuntime(config(DAEMON_URL));
     try {
       await runtime.ask(PET_QUERY);
       await runtime.ask(FLIGHT_QUERY);
       report("recall / two turns", runtime.adapter);
-
-      const turnOne = runtime.adapter.messageText(0);
-      const turnTwo = runtime.adapter.messageText(1);
       // eslint-disable-next-line no-console
-      console.log(`--- assembled request #1 (first 900 chars) ---\n${turnTwo.slice(0, 900)}\n---`);
+      console.log(
+        `--- turn 1 evidence ---\n${excerpt(runtime.adapter, 0)}\n` +
+          `--- turn 2 evidence ---\n${excerpt(runtime.adapter, 1)}\n---`
+      );
 
-      // The observed defect, asserted so a future fix makes this test fail loudly:
-      // turn 1 got nothing, and turn 2 carries turn 1's PET evidence rather than
-      // the flight evidence its own question asked for.
-      expect(turnOne).not.toContain("evidence_id=");
-      expect(turnTwo).toContain(PET_EVIDENCE);
+      // Turn 1 asked about pets and its best evidence is about pets.
+      expect(runtime.adapter.topEvidence(0)).toContain(PET_EVIDENCE);
+      // Turn 2 asked about the flight and its best evidence is about the
+      // flight. This is the regression that made the plugin useless: turn 2
+      // used to receive turn 1's block verbatim, answering the previous
+      // question.
+      expect(runtime.adapter.topEvidence(1)).toContain(FLIGHT_EVIDENCE);
+      expect(runtime.adapter.topEvidence(1)).not.toContain(PET_EVIDENCE);
+      // Two questions, two genuinely different recalls.
+      expect(runtime.adapter.evidenceText(1)).not.toBe(runtime.adapter.evidenceText(0));
     } finally {
       await runtime.dispose();
+    }
+  }, 60_000);
+});
+
+describe("recall costs one request per question", () => {
+  it("does not re-ask the daemon on every step of a tool loop", async () => {
+    // A real proxy in front of the real daemon, purely to count wire traffic.
+    const proxy = await startRecordingProxy(DAEMON_URL);
+    const runtime = await bootRuntime(config(proxy.url), { withTool: true });
+    try {
+      // Request 0 calls the tool; the loop dispatches it and comes back for
+      // request 1 in the SAME turn. Both steps assemble a prompt.
+      runtime.adapter.script = [toolCallReply("call-1", PING_TOOL), textReply("done")];
+      await runtime.ask(PET_QUERY);
+
+      const recalls = proxy.requests.filter((r) => r.path.startsWith("/v1/context"));
+      report(`tool loop (${recalls.length} recall requests)`, runtime.adapter);
+
+      // Two model requests in one turn...
+      expect(runtime.adapter.seen.length).toBe(2);
+      // ...and exactly one recall for the one question that was asked.
+      expect(recalls.length).toBe(1);
+      // Both steps still see the memory.
+      expect(runtime.adapter.topEvidence(0)).toContain(PET_EVIDENCE);
+      expect(runtime.adapter.topEvidence(1)).toContain(PET_EVIDENCE);
+    } finally {
+      await runtime.dispose();
+      await proxy.close();
     }
   }, 60_000);
 });
@@ -168,7 +218,7 @@ describe("retain fires", () => {
     expect(after).toBeGreaterThan(before);
   }, 60_000);
 
-  it("sends the closed turn's user and assistant prose as the body", async () => {
+  it("sends the closed turn's authored prose, and never its own recall", async () => {
     // A real reverse proxy in front of the real daemon: the daemon still
     // receives and processes the write; the proxy only reads the bytes.
     const proxy = await startRecordingProxy(DAEMON_URL);
@@ -180,7 +230,9 @@ describe("retain fires", () => {
       await proxy.close();
     }
 
-    const write = proxy.requests.find((r) => r.method === "POST" && r.path.startsWith("/v1/memories"));
+    const write = proxy.requests.find(
+      (r) => r.method === "POST" && r.path.startsWith("/v1/memories")
+    );
     // eslint-disable-next-line no-console
     console.log(`[retain] wire body:\n${write?.body}`);
     expect(write).toBeDefined();
@@ -192,9 +244,13 @@ describe("retain fires", () => {
     };
     expect(body.user_id).toBe(DAEMON_USER);
     expect(body.session_id).toMatch(/^integration-/);
+    // Exactly the human's question and the model's reply. The runtime-context
+    // snapshot carrying SodaMem's own evidence must NOT be here: ingesting it
+    // would feed the store its own output back on every turn.
     expect(body.messages).toEqual([
       { role: "user", content: PET_QUERY },
       { role: "assistant", content: "ok" },
     ]);
+    expect(write!.body).not.toContain("evidence_id=");
   }, 60_000);
 });

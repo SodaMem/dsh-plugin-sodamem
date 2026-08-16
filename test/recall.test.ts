@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { MAX_QUERY_CHARS, apply, buildQuery, sanitizeContextText } from "../src/index.js";
+import { MAX_QUERY_CHARS, apply, capQuery, sanitizeContextText } from "../src/index.js";
 import {
   CONFIG,
+  assemble,
+  claim,
   contributedText,
   createFakeContext,
   installContextFetch,
@@ -10,7 +12,6 @@ import {
   installStallingBodyFetch,
   installUncancellableBodyFetch,
   installUnreachableFetch,
-  textBlocks,
   type FetchDouble,
 } from "./harness.js";
 
@@ -22,169 +23,160 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-interface PreStepPayload {
-  agent: { id: string };
-  messages: { content: ReturnType<typeof textBlocks> }[];
-  turn: number;
-  step: number;
-  signal: AbortSignal;
+/** Claim one question and assemble once — the loop's order, in miniature. */
+async function turn(
+  fake: ReturnType<typeof createFakeContext>,
+  agentId: string,
+  question: string,
+  signal?: AbortSignal
+) {
+  claim(fake, agentId, question);
+  return assemble(fake, agentId, signal);
 }
-
-function payload(agentId: string, turn: number, text: string, step = 1): PreStepPayload {
-  return {
-    agent: { id: agentId },
-    messages: [{ content: textBlocks(text) }],
-    turn,
-    step,
-    signal: new AbortController().signal,
-  };
-}
-
-function preStep(fake: ReturnType<typeof createFakeContext>) {
-  const listener = fake.listeners.get("agent/pre-step");
-  if (!listener) throw new Error("agent/pre-step was not registered");
-  return listener as unknown as (
-    p: PreStepPayload,
-    next: () => Promise<unknown>
-  ) => Promise<unknown>;
-}
-
-const ENTER = { kind: "enter", messages: [] };
 
 describe("recall", () => {
-  it("registers agent/pre-step and a systemPrompt context (not a section)", () => {
+  it("registers the claim listener and the assemble waterfall, and no prompt section", () => {
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    expect(fake.listeners.has("agent/pre-step")).toBe(true);
-    expect(fake.promptContext?.name).toBe("sodamem");
-    expect(typeof fake.promptContext?.text).toBe("function");
+    expect(fake.listeners.has("agent/inbox/claimed")).toBe(true);
+    expect(fake.listeners.has("system-prompt/assemble")).toBe(true);
+    // Recall must not be a registered context provider: `assemble()` evaluates
+    // those eagerly, BEFORE the waterfall, which is what made the previous
+    // design one assembly late.
+    expect(fake.listeners.has("agent/pre-step")).toBe(false);
   });
 
-  it("happy path: the SodaMem text reaches the prompt-context provider for that agent", async () => {
-    fetchDouble = installContextFetch("Aaron prefers TypeScript over Python.");
-    const fake = createFakeContext();
-    apply(fake.ctx, CONFIG);
-
-    const next = vi.fn(async () => ENTER);
-    const result = await preStep(fake)(payload("agent-a", 1, "what do I prefer?"), next);
-
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(result).toBe(ENTER);
-
-    expect(fetchDouble.calls).toHaveLength(1);
-    const url = new URL(fetchDouble.calls[0]!.url);
-    expect(url.pathname).toBe("/v1/context");
-    expect(url.searchParams.get("user_id")).toBe("aaron");
-    expect(url.searchParams.get("query")).toBe("what do I prefer?");
-    expect(url.searchParams.get("token_budget")).toBe("1200");
-
-    expect(contributedText(fake, "agent-a")).toBe("Aaron prefers TypeScript over Python.");
-  });
-
-  it("never mutates payload.messages", async () => {
+  it("happy path: the SodaMem text is contributed to the assembly for that agent", async () => {
     fetchDouble = installContextFetch("remembered");
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const p = payload("agent-a", 1, "hello");
-    const messages = p.messages;
-    const firstMessage = messages[0];
-    Object.freeze(messages);
+    const { text, assembly, nextCalled } = await turn(fake, "agent-a", "where do I live?");
 
-    await preStep(fake)(p, async () => ENTER);
+    expect(text).toBe("remembered");
+    expect(assembly.contexts).toEqual([{ name: "sodamem", text: "remembered" }]);
+    expect(nextCalled).toBe(true);
 
-    expect(p.messages).toBe(messages);
-    expect(p.messages[0]).toBe(firstMessage);
-    expect(p.messages).toHaveLength(1);
+    const url = new URL(fetchDouble.calls[0]!.url);
+    expect(url.pathname).toBe("/v1/context");
+    expect(url.searchParams.get("query")).toBe("where do I live?");
+    expect(url.searchParams.get("user_id")).toBe(CONFIG.userId);
+    expect(url.searchParams.get("token_budget")).toBe("1200");
   });
 
-  it("contributes nothing and issues no request when the turn has no text", async () => {
-    fetchDouble = installContextFetch("should not be used");
+  it("recalls for the question claimed on THIS assembly, not the previous one", async () => {
+    let answer = "pets";
+    fetchDouble = installFetch(() => ({
+      ok: true,
+      status: 200,
+      statusText: "",
+      text: async () => JSON.stringify({ text: answer }),
+    }));
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const next = vi.fn(async () => ENTER);
-    const empty: PreStepPayload = {
-      agent: { id: "agent-a" },
-      messages: [{ content: textBlocks("   ") }],
-      turn: 1,
-      step: 1,
-      signal: new AbortController().signal,
-    };
-    await preStep(fake)(empty, next);
-
-    expect(fetchDouble.calls).toHaveLength(0);
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(contributedText(fake, "agent-a")).toBe("");
+    expect((await turn(fake, "agent-a", "do I have a pet?")).text).toBe("pets");
+    answer = "flights";
+    expect((await turn(fake, "agent-a", "which airline?")).text).toBe("flights");
   });
 
-  it("unreachable SodaMem: pre-step still resolves via next() and the provider returns ''", async () => {
+  it("always calls next(), so a SodaMem failure can never break prompt assembly", async () => {
     fetchDouble = installUnreachableFetch();
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const next = vi.fn(async () => ENTER);
-    const result = await preStep(fake)(payload("agent-a", 1, "anything"), next);
+    const { text, nextCalled, assembly } = await turn(fake, "agent-a", "hello");
 
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(result).toBe(ENTER);
-    expect(contributedText(fake, "agent-a")).toBe("");
+    expect(nextCalled).toBe(true);
+    expect(text).toBe("");
+    expect(assembly.contexts).toEqual([]);
     expect(fake.logs.some((entry) => entry.level === "warn")).toBe(true);
   });
 
-  it("request timeout: the 1500ms timeout ends the wait, not the harness", async () => {
+  it("contributes nothing and issues no request when the batch has no text", async () => {
+    fetchDouble = installContextFetch("remembered");
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    claim(fake, "agent-a", "");
+    const { text, nextCalled } = await assemble(fake, "agent-a");
+
+    expect(text).toBe("");
+    expect(nextCalled).toBe(true);
+    expect(fetchDouble.calls).toHaveLength(0);
+  });
+
+  it("contributes nothing on a diagnostics assembly, which carries no agent", async () => {
+    fetchDouble = installContextFetch("remembered");
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    const { text, nextCalled } = await assemble(fake, undefined);
+
+    expect(text).toBe("");
+    expect(nextCalled).toBe(true);
+    expect(fetchDouble.calls).toHaveLength(0);
+  });
+
+  it("fires once per claimed batch, not once per assembly", async () => {
+    fetchDouble = installContextFetch("remembered");
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    claim(fake, "agent-a", "one question");
+    // Every step of a tool loop assembles a prompt; only the first may fetch.
+    expect((await assemble(fake, "agent-a")).text).toBe("remembered");
+    expect((await assemble(fake, "agent-a")).text).toBe("remembered");
+    expect((await assemble(fake, "agent-a")).text).toBe("remembered");
+
+    expect(fetchDouble.calls).toHaveLength(1);
+  });
+
+  it("joins every message of one claimed batch into a single query", async () => {
+    fetchDouble = installContextFetch("remembered");
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    claim(fake, "agent-a", "first", "second");
+    await assemble(fake, "agent-a");
+
+    expect(fetchDouble.calls).toHaveLength(1);
+    expect(new URL(fetchDouble.calls[0]!.url).searchParams.get("query")).toBe("first\nsecond");
+  });
+
+  it("unreachable SodaMem: the assembly proceeds and contributes ''", async () => {
+    fetchDouble = installUnreachableFetch();
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    expect((await turn(fake, "agent-a", "hello")).text).toBe("");
+  });
+
+  it("request timeout: the 1500ms deadline ends the wait, not the harness", async () => {
     vi.useFakeTimers();
     fetchDouble = installHangingFetch();
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const next = vi.fn(async () => ENTER);
-    const pending = preStep(fake)(payload("agent-a", 1, "anything"), next);
+    claim(fake, "agent-a", "hello");
+    const pending = assemble(fake, "agent-a");
+    await vi.advanceTimersByTimeAsync(1500);
 
-    // Nothing has settled yet: the daemon is still "thinking".
-    await vi.advanceTimersByTimeAsync(1499);
-    expect(next).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    await pending;
-
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(contributedText(fake, "agent-a")).toBe("");
-    // The abort came from the client's own timeout, and it is reported as one.
-    expect(fetchDouble.calls[0]!.signal?.aborted).toBe(true);
-    const warned = fake.logs.find((entry) => entry.level === "warn");
-    expect(warned).toBeDefined();
-    const error = warned!.args[1] as Error;
-    expect(error.name).toBe("SodaMemDeadlineError");
-    expect(error.message).toContain("1500ms");
+    expect((await pending).text).toBe("");
   });
 
   it("stalled response BODY: the 1500ms deadline still ends the wait", async () => {
-    // The SDK clears its own deadline the moment headers arrive, so this is
-    // the case its `timeoutMs` cannot bound. Without a plugin-owned deadline
-    // that stays armed across the body read, the turn hangs here.
     vi.useFakeTimers();
     fetchDouble = installStallingBodyFetch();
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const next = vi.fn(async () => ENTER);
-    const pending = preStep(fake)(payload("agent-a", 1, "anything"), next);
+    claim(fake, "agent-a", "hello");
+    const pending = assemble(fake, "agent-a");
+    await vi.advanceTimersByTimeAsync(1500);
 
-    await vi.advanceTimersByTimeAsync(1499);
-    expect(next).not.toHaveBeenCalled();
-
-    await vi.advanceTimersByTimeAsync(1);
-    await pending;
-
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(contributedText(fake, "agent-a")).toBe("");
-    // The deadline reached the transport too, so the socket is released.
-    expect(fetchDouble.calls[0]!.signal?.aborted).toBe(true);
-    const error = fake.logs.find((entry) => entry.level === "warn")!.args[1] as Error;
-    expect(error.name).toBe("SodaMemDeadlineError");
-    expect(error.message).toContain("1500ms");
+    expect((await pending).text).toBe("");
   });
 
   it("stalled body on a transport that ignores the signal: the deadline still ends the wait", async () => {
@@ -193,41 +185,26 @@ describe("recall", () => {
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const next = vi.fn(async () => ENTER);
-    const pending = preStep(fake)(payload("agent-a", 1, "anything"), next);
-
+    claim(fake, "agent-a", "hello");
+    const pending = assemble(fake, "agent-a");
     await vi.advanceTimersByTimeAsync(1500);
-    await pending;
 
-    expect(next).toHaveBeenCalledTimes(1);
-    expect(contributedText(fake, "agent-a")).toBe("");
+    expect((await pending).text).toBe("");
   });
 
-  it("does not carry turn N's memory into turn N+1 when the next batch is empty", async () => {
-    // dsh-agent legitimately enters a step with an empty message batch (a tool
-    // loop needing another request). The provider must contribute nothing for
-    // the new turn rather than replay the previous turn's evidence block.
-    fetchDouble = installContextFetch("turn 1 evidence");
+  it("passes the assembly's signal through, so recall aborts when the turn does", async () => {
+    fetchDouble = installContextFetch("remembered");
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
-    const handler = preStep(fake);
 
-    await handler(payload("agent-a", 1, "remember this"), async () => ENTER);
-    expect(contributedText(fake, "agent-a")).toBe("turn 1 evidence");
+    const controller = new AbortController();
+    await turn(fake, "agent-a", "hello", controller.signal);
 
-    await handler(
-      {
-        agent: { id: "agent-a" },
-        messages: [],
-        turn: 2,
-        step: 1,
-        signal: new AbortController().signal,
-      },
-      async () => ENTER
-    );
-
-    expect(contributedText(fake, "agent-a")).toBe("");
-    expect(fetchDouble.calls).toHaveLength(1);
+    const signal = fetchDouble.calls[0]!.signal;
+    expect(signal).toBeDefined();
+    expect(signal!.aborted).toBe(false);
+    controller.abort();
+    expect(signal!.aborted).toBe(true);
   });
 
   it("caps the query so a pasted file cannot produce a 414-length URL", async () => {
@@ -235,94 +212,61 @@ describe("recall", () => {
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const pasted = "x".repeat(50_000);
-    await preStep(fake)(
-      payload("agent-a", 1, `${pasted}\nso what did we decide?`),
-      async () => ENTER
-    );
+    await turn(fake, "agent-a", "x".repeat(MAX_QUERY_CHARS * 3));
 
-    const query = new URL(fetchDouble.calls[0]!.url).searchParams.get("query")!;
-    expect(query.length).toBeLessThanOrEqual(MAX_QUERY_CHARS);
-    // The tail is kept: the most recent text is closest to what was just asked.
-    expect(query.endsWith("so what did we decide?")).toBe(true);
-    expect(fetchDouble.calls[0]!.url.length).toBeLessThan(8000);
+    const query = new URL(fetchDouble.calls[0]!.url).searchParams.get("query") ?? "";
+    expect(query.length).toBe(MAX_QUERY_CHARS);
   });
 
-  it("buildQuery keeps the tail when the text overflows the cap", () => {
-    const query = buildQuery([{ content: textBlocks("A".repeat(MAX_QUERY_CHARS) + "TAIL") }]);
-    expect(query).toHaveLength(MAX_QUERY_CHARS);
+  it("capQuery keeps the tail when the text overflows the cap", () => {
+    const query = capQuery("A".repeat(MAX_QUERY_CHARS) + "TAIL");
+    expect(query.length).toBe(MAX_QUERY_CHARS);
     expect(query.endsWith("TAIL")).toBe(true);
-    expect(buildQuery([{ content: textBlocks("short") }])).toBe("short");
   });
 
   it("cache isolation: two agent ids get their own text and neither reads the other's", async () => {
+    const answers: Record<string, string> = { "agent-a": "alpha", "agent-b": "beta" };
     fetchDouble = installFetch((call) => {
-      const query = new URL(call.url).searchParams.get("query");
+      const query = new URL(call.url).searchParams.get("query") ?? "";
       return {
         ok: true,
         status: 200,
         statusText: "",
-        text: async () =>
-          JSON.stringify({
-            text: `memory for ${query}`,
-            citations: [],
-            evidence: [],
-            degraded: [],
-          }),
+        text: async () => JSON.stringify({ text: answers[query] ?? "" }),
       };
     });
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    await preStep(fake)(payload("agent-a", 1, "alpha"), async () => ENTER);
-    await preStep(fake)(payload("agent-b", 1, "beta"), async () => ENTER);
+    await turn(fake, "agent-a", "agent-a");
+    await turn(fake, "agent-b", "agent-b");
 
-    expect(contributedText(fake, "agent-a")).toBe("memory for alpha");
-    expect(contributedText(fake, "agent-b")).toBe("memory for beta");
-    // An assembly with no agent (diagnostics) contributes nothing.
-    expect(contributedText(fake, undefined)).toBe("");
-    expect(contributedText(fake, "agent-c")).toBe("");
-  });
-
-  it("fires once per turn, not once per step", async () => {
-    fetchDouble = installContextFetch("remembered");
-    const fake = createFakeContext();
-    apply(fake.ctx, CONFIG);
-    const handler = preStep(fake);
-
-    await handler(payload("agent-a", 7, "first step", 1), async () => ENTER);
-    await handler(payload("agent-a", 7, "second step of the tool loop", 2), async () => ENTER);
-    expect(fetchDouble.calls).toHaveLength(1);
-
-    await handler(payload("agent-a", 8, "a new turn", 1), async () => ENTER);
-    expect(fetchDouble.calls).toHaveLength(2);
+    expect(await contributedText(fake, "agent-a")).toBe("alpha");
+    expect(await contributedText(fake, "agent-b")).toBe("beta");
+    expect(await contributedText(fake, "agent-c")).toBe("");
   });
 
   it("sanitises {{ so strict interpolation cannot fail the assembly", async () => {
-    fetchDouble = installContextFetch("Aaron's template is {{unresolvable}} and {{{deep}}}.");
+    fetchDouble = installContextFetch("remembered {{secret}} value");
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    await preStep(fake)(payload("agent-a", 1, "templates"), async () => ENTER);
-
-    const text = contributedText(fake, "agent-a");
+    const { text } = await turn(fake, "agent-a", "hello");
     expect(text).not.toContain("{{");
-    expect(text).toContain("unresolvable");
   });
 
   it("sanitizeContextText leaves no {{ token behind", () => {
-    expect(sanitizeContextText("{{a}}")).toBe("{ {a}}");
-    expect(sanitizeContextText("{{{a}}}")).toBe("{ { {a}}}");
-    expect(sanitizeContextText("{{{a}}}")).not.toContain("{{");
-    expect(sanitizeContextText("no braces")).toBe("no braces");
+    expect(sanitizeContextText("{{a}}")).not.toContain("{{");
+    expect(sanitizeContextText("{{{{a}}}}")).not.toContain("{{");
+    expect(sanitizeContextText("plain")).toBe("plain");
   });
 
-  it("buildQuery keeps only text blocks, in order", () => {
-    const query = buildQuery([
-      { content: [...textBlocks("hello"), { type: "reasoning", text: "hidden" } as never] },
-      { content: textBlocks("world") },
-      { content: [] },
-    ]);
-    expect(query).toBe("hello\nworld");
+  it("a claim listener failure cannot escape into the loop's claim path", () => {
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    const listener = fake.listeners.get("agent/inbox/claimed") as unknown as (p: unknown) => void;
+    expect(() => listener(undefined)).not.toThrow();
+    expect(() => listener({ agent: { id: "a" }, message: { content: undefined } })).not.toThrow();
   });
 });

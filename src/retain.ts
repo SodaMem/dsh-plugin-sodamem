@@ -24,6 +24,29 @@ export interface RetainEvent {
 export interface DerivedMessage {
   readonly role?: string;
   readonly content?: readonly ContentBlock[];
+  readonly source?: { readonly kind?: string };
+}
+
+/**
+ * Whether a projected message is prose somebody actually produced.
+ *
+ * `role` alone is not enough. The harness carries several things as
+ * `role: 'user'` that nobody said: tool results (`kind: 'tool'`) are machine
+ * chatter that would drown the extractor, and plugin-authored context
+ * (`kind: 'plugin'`) includes the runtime-context snapshot — which is where
+ * THIS plugin's own recalled evidence lives.
+ *
+ * Ingesting that snapshot would feed SodaMem its own output back on every
+ * turn: each recall would be re-extracted as fresh facts, which the next
+ * recall would return, and the store would amplify its own echo. Only the
+ * human's `kind: 'user'` prose and the model's `kind: 'model'` replies are
+ * worth remembering.
+ */
+function isAuthoredProse(derived: DerivedMessage): boolean {
+  const kind = derived.source?.kind;
+  if (derived.role === "user") return kind === "user";
+  if (derived.role === "assistant") return kind === "model";
+  return false;
 }
 
 /** The subset of `Session` retain reads. */
@@ -51,9 +74,9 @@ function isTurnStart(event: RetainEvent, turn: number): boolean {
 }
 
 /**
- * The closed turn's user and assistant messages, in log order, rendered to
- * flat text. Empty when the turn produced nothing worth remembering — in which
- * case nothing is ingested.
+ * The closed turn's authored prose — what the human said and what the model
+ * replied — in log order, rendered to flat text. Empty when the turn produced
+ * nothing worth remembering, in which case nothing is ingested.
  */
 export function collectTurnMessages(session: RetainSession, turn: number): Message[] {
   const events = session?.events;
@@ -75,10 +98,10 @@ export function collectTurnMessages(session: RetainSession, turn: number): Messa
     if (!event) continue;
     const derived = session.deriveEventMessage(event);
     if (!derived) continue;
-    if (derived.role !== "user" && derived.role !== "assistant") continue;
+    if (!isAuthoredProse(derived)) continue;
     const content = renderTextBlocks(derived.content);
     if (!content) continue;
-    messages.push({ role: derived.role, content });
+    messages.push({ role: derived.role as Message["role"], content });
   }
   return messages;
 }

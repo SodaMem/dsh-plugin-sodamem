@@ -9,7 +9,9 @@ import {
   installStallingBodyFetch,
   installUncancellableBodyFetch,
   installUnreachableFetch,
+  snapshotMessage,
   textBlocks,
+  toolResultMessage,
   userMessage,
   type FakeEvent,
   type FetchDouble,
@@ -107,6 +109,31 @@ describe("retain", () => {
     });
 
     expect(fetchDouble.calls).toHaveLength(0);
+  });
+
+  it("never ingests its own recalled evidence back into SodaMem", () => {
+    // The runtime-context snapshot is `role: 'user'` and carries the evidence
+    // block THIS plugin just recalled. Ingesting it would feed the store its
+    // own output on every turn, and each recall would be re-extracted as fresh
+    // facts for the next one to return.
+    const events: FakeEvent[] = [
+      { type: "turn/start", data: { turn: 1 } },
+      { type: "user/message", data: {}, message: userMessage("do I have a pet?") },
+      {
+        type: "user/message",
+        data: {},
+        message: snapshotMessage(
+          "Current runtime context.\n\n- evidence_id=ev_fact:1 support=I adopted a corgi."
+        ),
+      },
+      { type: "tool/result", data: {}, message: toolResultMessage("pong") },
+      { type: "assistant/message", data: {}, message: assistantMessage("You have a corgi.") },
+    ];
+
+    expect(collectTurnMessages(fakeSession(events), 1)).toEqual([
+      { role: "user", content: "do I have a pet?" },
+      { role: "assistant", content: "You have a corgi." },
+    ]);
   });
 
   it("ingests nothing when the turn's turn/start is not in the log", () => {

@@ -2,9 +2,14 @@
  * Test doubles. Everything is mocked at the HTTP boundary (`globalThis.fetch`)
  * and at the Cordis registration boundary — no live daemon, ever, and no dsh
  * runtime either.
+ *
+ * These doubles prove the units. They cannot prove the plugin works inside the
+ * real loop — that is what `test-integration/` is for, and the ordering bug it
+ * caught is exactly the class of failure a double like this cannot see.
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
+import type { PromptAssembly } from "@deepseek-ai/dsh-system-prompt";
 import type { SodaMemConfig } from "../src/config.js";
 
 export const CONFIG: SodaMemConfig = {
@@ -137,18 +142,11 @@ export function installHangingFetch(): FetchDouble {
 
 // --- cordis context double ---------------------------------------------------
 
-export interface PromptContextRegistration {
-  name: string;
-  order: number;
-  text: string | ((assembleCtx: unknown) => string);
-}
-
 export interface FakeContext {
   ctx: Context;
   listeners: Map<string, (...args: never[]) => unknown>;
   /** Registration labels whose disposer has been called, in call order. */
   disposedLabels: string[];
-  promptContext: PromptContextRegistration | undefined;
   /** Run the disposer `apply()` handed to `ctx.effect()`. */
   unload(): void;
   logs: { level: string; args: unknown[] }[];
@@ -164,7 +162,6 @@ export function createFakeContext(): FakeContext {
     ctx: undefined as unknown as Context,
     listeners,
     disposedLabels,
-    promptContext: undefined,
     logs,
     unload() {
       effectDisposer?.();
@@ -184,14 +181,6 @@ export function createFakeContext(): FakeContext {
 
   const ctx = {
     logger,
-    systemPrompt: {
-      context(registration: PromptContextRegistration) {
-        state.promptContext = registration;
-        return () => {
-          disposedLabels.push("systemPrompt.context");
-        };
-      },
-    },
     on(event: string, listener: (...args: never[]) => unknown) {
       listeners.set(event, listener);
       return () => {
@@ -209,13 +198,58 @@ export function createFakeContext(): FakeContext {
   return state;
 }
 
-/** The `text` provider registered as `systemPrompt.context`, called for one agent. */
-export function contributedText(fake: FakeContext, agentId: string | undefined): string {
-  const registration = fake.promptContext;
-  if (!registration) throw new Error("no systemPrompt.context registered");
-  const { text } = registration;
-  if (typeof text === "string") return text;
-  return text(agentId === undefined ? {} : { agent: { id: agentId } });
+// --- driving the plugin's two recall listeners ------------------------------
+
+/** A fresh, empty prompt assembly, as `SystemPrompt.assemble()` builds one. */
+export function emptyAssembly(): PromptAssembly {
+  return { sections: [], contexts: [], tools: [], variables: {} };
+}
+
+/** Deliver one `agent/inbox/claimed` event, the way the loop does while claiming. */
+export function claim(fake: FakeContext, agentId: string, ...texts: string[]): void {
+  const listener = fake.listeners.get("agent/inbox/claimed") as unknown as (p: unknown) => void;
+  if (!listener) throw new Error("no agent/inbox/claimed listener registered");
+  for (const text of texts) {
+    listener({ agent: { id: agentId }, message: { content: textBlocks(text) } });
+  }
+}
+
+/**
+ * Run the `system-prompt/assemble` waterfall once and return the assembly the
+ * loop would use, plus whatever SodaMem contributed to it.
+ */
+export async function assemble(
+  fake: FakeContext,
+  agentId: string | undefined,
+  signal?: AbortSignal
+): Promise<{ assembly: PromptAssembly; text: string; nextCalled: boolean }> {
+  const listener = fake.listeners.get("system-prompt/assemble") as unknown as (
+    assembly: PromptAssembly,
+    context: unknown,
+    next: () => Promise<PromptAssembly>
+  ) => Promise<PromptAssembly>;
+  if (!listener) throw new Error("no system-prompt/assemble listener registered");
+
+  const assembly = emptyAssembly();
+  const context: Record<string, unknown> = {};
+  if (agentId !== undefined) context.agent = { id: agentId };
+  if (signal !== undefined) context.signal = signal;
+
+  let nextCalled = false;
+  const result = await listener(assembly, context, async () => {
+    nextCalled = true;
+    return assembly;
+  });
+  const contributed = result.contexts.find((entry) => entry.name === "sodamem");
+  return { assembly: result, text: contributed?.text ?? "", nextCalled };
+}
+
+/** The SodaMem text contributed to one assembly for one agent. */
+export async function contributedText(
+  fake: FakeContext,
+  agentId: string | undefined
+): Promise<string> {
+  return (await assemble(fake, agentId)).text;
 }
 
 // --- payload builders --------------------------------------------------------
@@ -224,18 +258,37 @@ export function textBlocks(...texts: string[]): ContentBlock[] {
   return texts.map((text) => ({ type: "text", text }) as ContentBlock);
 }
 
-export function userMessage(text: string): { role: "user"; content: ContentBlock[] } {
-  return { role: "user", content: textBlocks(text) };
+/** Prose the human actually typed. */
+export function userMessage(text: string) {
+  return { role: "user" as const, content: textBlocks(text), source: { kind: "user" as const } };
 }
 
-export function assistantMessage(text: string): { role: "assistant"; content: ContentBlock[] } {
-  return { role: "assistant", content: textBlocks(text) };
+/** Prose the model produced. */
+export function assistantMessage(text: string) {
+  return { role: "assistant" as const, content: textBlocks(text), source: { kind: "model" as const } };
+}
+
+/** A tool result — `role: 'user'`, but nobody said it. */
+export function toolResultMessage(text: string) {
+  return { role: "user" as const, content: textBlocks(text), source: { kind: "tool" as const } };
+}
+
+/**
+ * The harness's runtime-context snapshot — `role: 'user'`, authored by a
+ * plugin, and the carrier of THIS plugin's own recalled evidence.
+ */
+export function snapshotMessage(text: string) {
+  return {
+    role: "user" as const,
+    content: textBlocks(text),
+    source: { kind: "plugin" as const, plugin: "@deepseek-ai/dsh-system-prompt", form: "snapshot" },
+  };
 }
 
 export interface FakeEvent {
   type: string;
   data: unknown;
-  message?: { role: string; content: ContentBlock[] };
+  message?: { role: string; content: ContentBlock[]; source?: { kind?: string } };
 }
 
 /** A session double whose `deriveEventMessage` projects the event's message. */
