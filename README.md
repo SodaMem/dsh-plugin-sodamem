@@ -6,24 +6,10 @@ A standalone plugin for the [DeepSeek Harness](https://github.com/deepseek-ai/de
 
 The plugin installs SodaMem as a **memory layer**, not as a tool in the model's tool bag.
 
-- **Recall** — before every turn, the plugin fetches a prompt-ready evidence block from SodaMem and contributes it to the system prompt.
+- **Recall** — while every turn is being assembled, the plugin fetches a prompt-ready evidence block from SodaMem and contributes it to that turn's prompt.
 - **Retain** — when every turn closes, the plugin ingests that turn's messages back into SodaMem.
 
 Neither one is a tool call, so neither one depends on the model deciding to use it.
-
-> ## ⚠️ Not ready for use: recall lands one turn late
->
-> Verified against a real `dsh` runtime and a real SodaMem daemon
-> (`npm run test:integration`): **recall does not reach the model on the turn
-> that asked.** `AgentLoop.preStep()` assembles the system prompt and projects
-> the runtime-context snapshot *before* it dispatches the `agent/pre-step`
-> waterfall this plugin recalls in, so turn N's evidence arrives in turn N+1's
-> request — answering the previous question.
->
-> Retain, the failure-degradation path, and the call deadlines all hold. Recall
-> does not. See [`test-integration/README.md`](test-integration/README.md) for
-> the evidence and the likely fix (move recall onto the asynchronous
-> `system-prompt/assemble` waterfall).
 
 ## Why not the MCP bridge?
 
@@ -115,7 +101,9 @@ Two processes writing one `SODAMEM_DATA_ROOT` corrupt it — per-user SQLite wit
 
 The deadlines cover the **whole** call, headers and response body alike, so a daemon that answers `200` and then stalls mid-body cannot hang a turn.
 
-Recall fires **once per turn**, not once per step — a tool loop that takes six steps still issues one `GET /v1/context`.
+Recall fires **once per question**, not once per prompt assembly — a tool loop that takes six steps still issues one `GET /v1/context`. Steering mid-turn is a new question, so it earns its own recall.
+
+Retain ingests only what a human or the model actually said. Tool results and the harness's runtime-context snapshot are excluded — the snapshot is where this plugin's own recalled evidence lives, and ingesting it would feed the store its own output back on every turn.
 
 The one thing to know: when recall misses its deadline, the turn proceeds *without memory* and nothing surfaces to the user. The plugin logs a warning (`ctx.logger.warn`) on every degraded turn, and that log is the only signal you get. See the performance note below.
 
@@ -139,10 +127,15 @@ npm run build     # dual ESM/CJS into dist/
 npm run test:integration   # real dsh runtime + real daemon; not run by CI
 ```
 
-`npm run test:integration` loads the plugin into a real `dsh` runtime and talks
-to a running SodaMem daemon. It stubs only the LLM adapter. See
-[`test-integration/README.md`](test-integration/README.md) for how to start the
-daemon and for the recall defect it currently exposes.
+`npm run test:integration` loads the plugin into a real `dsh` runtime — real
+Cordis `Context`, real session store, real system-prompt registry, real agent
+loop — and drives real turns against a running SodaMem daemon. It stubs only the
+LLM adapter. See [`test-integration/README.md`](test-integration/README.md) for
+how to start the daemon.
+
+The unit tests cannot prove the plugin works inside the loop: they mock the
+Cordis registration boundary, so they cannot see ordering. Treat the integration
+suite as the gate.
 
 ## License
 

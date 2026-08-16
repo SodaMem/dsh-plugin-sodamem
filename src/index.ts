@@ -2,7 +2,8 @@
  * dsh-plugin-sodamem — SodaMem as a memory layer for the DeepSeek Harness.
  *
  * Recall is unconditional: every turn is assembled with whatever SodaMem
- * knows, through `agent/pre-step` + `systemPrompt.context`.
+ * knows, through `agent/inbox/claimed` + the `system-prompt/assemble`
+ * waterfall.
  * Retain is unconditional: every closed turn is ingested, through
  * `agent/turn-stopping`.
  *
@@ -17,8 +18,8 @@
 import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-agent";
 import { RecallCache } from "./cache.js";
-import { CONTEXT_NAME, CONTEXT_ORDER, Config, type SodaMemConfig } from "./config.js";
-import { createContextTextProvider, createRecallListener, type PluginLogger } from "./recall.js";
+import { Config, type SodaMemConfig } from "./config.js";
+import { createAssembleListener, createClaimListener, type PluginLogger } from "./recall.js";
 import { createRetainListener } from "./retain.js";
 
 export { Config, type SodaMemConfig } from "./config.js";
@@ -27,10 +28,9 @@ export {
   RETAIN_TIMEOUT_MS,
   MAX_QUERY_CHARS,
   CONTEXT_NAME,
-  CONTEXT_ORDER,
 } from "./config.js";
 export { RecallCache, type RecallEntry } from "./cache.js";
-export { buildQuery, createContextTextProvider, createRecallListener } from "./recall.js";
+export { capQuery, createAssembleListener, createClaimListener } from "./recall.js";
 export { collectTurnMessages, createRetainListener } from "./retain.js";
 export { renderTextBlocks, sanitizeContextText } from "./messages.js";
 export { createClient, withSodaMem, SodaMemDeadlineError } from "./client.js";
@@ -44,12 +44,8 @@ export function apply(ctx: Context, config: SodaMemConfig): void {
   const logger = ctx.logger as unknown as PluginLogger;
 
   const disposers: Array<() => unknown> = [
-    ctx.systemPrompt.context({
-      name: CONTEXT_NAME,
-      order: CONTEXT_ORDER,
-      text: createContextTextProvider(cache),
-    }),
-    ctx.on("agent/pre-step", createRecallListener({ config, cache, logger })),
+    ctx.on("agent/inbox/claimed", createClaimListener({ cache, logger })),
+    ctx.on("system-prompt/assemble", createAssembleListener({ config, cache, logger })),
     ctx.on("agent/turn-stopping", createRetainListener({ config, logger })),
     ctx.on("agent/disposed", (payload) => {
       cache.delete(payload.agent.id);

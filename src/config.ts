@@ -65,6 +65,11 @@ export const RETAIN_TIMEOUT_MS = 5000;
  */
 export const MAX_QUERY_CHARS = 1024;
 
-/** Prompt-context registration name and order. */
+/**
+ * Name of the assembled context this plugin contributes.
+ *
+ * There is no companion order constant: the contribution is pushed onto the
+ * assembly from the `system-prompt/assemble` waterfall, which runs after the
+ * registry has already ordered every registered provider, so it lands last.
+ */
 export const CONTEXT_NAME = "sodamem";
-export const CONTEXT_ORDER = 200;

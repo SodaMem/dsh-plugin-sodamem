@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it } from "vitest";
 import { Config, apply, inject, name } from "../src/index.js";
 import {
   CONFIG,
+  assemble,
+  claim,
   contributedText,
   createFakeContext,
   installContextFetch,
-  textBlocks,
   type FetchDouble,
 } from "./harness.js";
 
@@ -39,26 +40,16 @@ describe("plugin surface", () => {
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const preStep = fake.listeners.get("agent/pre-step") as unknown as (
-      p: unknown,
-      next: () => Promise<unknown>
-    ) => Promise<unknown>;
-    const payload = (id: string) => ({
-      agent: { id },
-      messages: [{ content: textBlocks("hello") }],
-      turn: 1,
-      step: 1,
-      signal: new AbortController().signal,
-    });
-
-    await preStep(payload("agent-a"), async () => ({ kind: "enter", messages: [] }));
-    await preStep(payload("agent-b"), async () => ({ kind: "enter", messages: [] }));
+    for (const id of ["agent-a", "agent-b"]) {
+      claim(fake, id, "hello");
+      await assemble(fake, id);
+    }
 
     const disposed = fake.listeners.get("agent/disposed") as unknown as (p: unknown) => void;
     disposed({ agent: { id: "agent-a" } });
 
-    expect(contributedText(fake, "agent-a")).toBe("");
-    expect(contributedText(fake, "agent-b")).toBe("remembered");
+    expect(await contributedText(fake, "agent-a")).toBe("");
+    expect(await contributedText(fake, "agent-b")).toBe("remembered");
   });
 
   it("unload disposes every registration and empties the cache", async () => {
@@ -66,31 +57,18 @@ describe("plugin surface", () => {
     const fake = createFakeContext();
     apply(fake.ctx, CONFIG);
 
-    const preStep = fake.listeners.get("agent/pre-step") as unknown as (
-      p: unknown,
-      next: () => Promise<unknown>
-    ) => Promise<unknown>;
-    await preStep(
-      {
-        agent: { id: "agent-a" },
-        messages: [{ content: textBlocks("hello") }],
-        turn: 1,
-        step: 1,
-        signal: new AbortController().signal,
-      },
-      async () => ({ kind: "enter", messages: [] })
-    );
-    expect(contributedText(fake, "agent-a")).toBe("remembered");
+    claim(fake, "agent-a", "hello");
+    expect((await assemble(fake, "agent-a")).text).toBe("remembered");
 
     fake.unload();
 
     expect(fake.disposedLabels.sort()).toEqual([
       "agent/disposed",
-      "agent/pre-step",
+      "agent/inbox/claimed",
       "agent/turn-stopping",
-      "systemPrompt.context",
+      "system-prompt/assemble",
     ]);
     // The cache went with the registrations.
-    expect(contributedText(fake, "agent-a")).toBe("");
+    expect(await contributedText(fake, "agent-a")).toBe("");
   });
 });
