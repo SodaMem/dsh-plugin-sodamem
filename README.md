@@ -11,6 +11,20 @@ The plugin installs SodaMem as a **memory layer**, not as a tool in the model's 
 
 Neither one is a tool call, so neither one depends on the model deciding to use it.
 
+> ## ⚠️ Not ready for use: recall lands one turn late
+>
+> Verified against a real `dsh` runtime and a real SodaMem daemon
+> (`npm run test:integration`): **recall does not reach the model on the turn
+> that asked.** `AgentLoop.preStep()` assembles the system prompt and projects
+> the runtime-context snapshot *before* it dispatches the `agent/pre-step`
+> waterfall this plugin recalls in, so turn N's evidence arrives in turn N+1's
+> request — answering the previous question.
+>
+> Retain, the failure-degradation path, and the call deadlines all hold. Recall
+> does not. See [`test-integration/README.md`](test-integration/README.md) for
+> the evidence and the likely fix (move recall onto the asynchronous
+> `system-prompt/assemble` waterfall).
+
 ## Why not the MCP bridge?
 
 SodaMem already has an MCP integration for `dsh`, in the main SodaMem repo ([`integrations/deepseek-harness/`](https://github.com/SodaMem/SodaMem/tree/main/integrations/deepseek-harness)). It exposes memory as **tools**, which means the model has to choose to call them — and on most turns it simply doesn't. The strongest thing SodaMem offers, the zero-LLM `GET /v1/context` evidence block, ends up left to the model's discretion.
@@ -121,7 +135,14 @@ npm install
 npm run typecheck
 npm test          # no live daemon required; HTTP is mocked at the fetch boundary
 npm run build     # dual ESM/CJS into dist/
+
+npm run test:integration   # real dsh runtime + real daemon; not run by CI
 ```
+
+`npm run test:integration` loads the plugin into a real `dsh` runtime and talks
+to a running SodaMem daemon. It stubs only the LLM adapter. See
+[`test-integration/README.md`](test-integration/README.md) for how to start the
+daemon and for the recall defect it currently exposes.
 
 ## License
 
