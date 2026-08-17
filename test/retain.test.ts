@@ -61,8 +61,8 @@ describe("retain", () => {
       signal: new AbortController().signal,
     });
 
-    expect(fetchDouble.calls).toHaveLength(1);
-    const call = fetchDouble.calls[0]!;
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+    const call = fetchDouble.recallCalls[0]!;
     expect(call.method).toBe("POST");
     expect(new URL(call.url).pathname).toBe("/v1/memories");
 
@@ -108,7 +108,51 @@ describe("retain", () => {
       signal: new AbortController().signal,
     });
 
-    expect(fetchDouble.calls).toHaveLength(0);
+    expect(fetchDouble.recallCalls).toHaveLength(0);
+  });
+
+  it("a second turn-stopping for the same turn does not re-ingest the same prose", async () => {
+    fetchDouble = installAcceptedFetch();
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    // The loop re-enters a turn when a listener queues next-step work, and
+    // collectTurnMessages always slices from turn/start — so without a guard
+    // the same prose is written twice into the user's store.
+    const payload = {
+      agent: { id: "session-42", session: fakeSession(closedTurnEvents()) },
+      turn: 1,
+      signal: new AbortController().signal,
+    };
+    await turnStopping(fake)(payload);
+    await turnStopping(fake)(payload);
+
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+  });
+
+  it("ingests only the tail when a re-entered turn really did produce more", async () => {
+    fetchDouble = installAcceptedFetch();
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    const events = closedTurnEvents();
+    const session = { events, deriveEventMessage: (e: FakeEvent) => e.message ?? null };
+    const payload = {
+      agent: { id: "session-42", session: session as never },
+      turn: 1,
+      signal: new AbortController().signal,
+    };
+
+    await turnStopping(fake)(payload);
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+
+    // The turn continued and said one more thing.
+    events.push({ type: "user/message", data: {}, message: userMessage("one more thing") });
+    await turnStopping(fake)(payload);
+
+    expect(fetchDouble.recallCalls).toHaveLength(2);
+    const second = JSON.parse(fetchDouble.recallCalls[1]!.body!) as { messages: unknown[] };
+    expect(second.messages).toEqual([{ role: "user", content: "one more thing" }]);
   });
 
   it("never ingests its own recalled evidence back into SodaMem", () => {
@@ -178,7 +222,7 @@ describe("retain", () => {
     await pending;
 
     expect(settled).toBe(true);
-    expect(fetchDouble.calls[0]!.signal?.aborted).toBe(true);
+    expect(fetchDouble.recallCalls[0]!.signal?.aborted).toBe(true);
     const error = fake.logs.find((entry) => entry.level === "warn")!.args[1] as Error;
     expect(error.name).toBe("SodaMemDeadlineError");
     expect(error.message).toContain("5000ms");

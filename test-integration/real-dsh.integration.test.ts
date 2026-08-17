@@ -11,6 +11,7 @@
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { RECALL_TIMEOUT_MS, RETAIN_TIMEOUT_MS } from "../src/config.js";
+import { WARMUP_QUERY } from "../src/warmup.js";
 import {
   DAEMON_KEY,
   DAEMON_URL,
@@ -23,6 +24,9 @@ import {
   type RecordingAdapter,
 } from "./runtime.js";
 import { startRecordingProxy, startStallingDaemon, type RunningServer } from "./servers.js";
+
+/** How the warm-up query appears in a request path, for filtering wire traffic. */
+const WARMUP_QUERY_ENCODED = encodeURIComponent(WARMUP_QUERY).replace(/%20/g, "+");
 
 const config = (apiUrl: string) => ({
   apiUrl,
@@ -71,12 +75,42 @@ function excerpt(adapter: RecordingAdapter, index: number, lines = 2): string {
     .join("\n");
 }
 
+/** One direct `/v1/context`, bypassing the plugin. Returns the HTTP status. */
+async function probe(query: string): Promise<number> {
+  const url = new URL("/v1/context", DAEMON_URL);
+  url.searchParams.set("user_id", DAEMON_USER);
+  url.searchParams.set("query", query);
+  url.searchParams.set("token_budget", "100");
+  const response = await fetch(url, { headers: { Authorization: `Bearer ${DAEMON_KEY}` } });
+  await response.text();
+  return response.status;
+}
+
 beforeAll(async () => {
   const response = await fetch(new URL("/health", DAEMON_URL)).catch(() => undefined);
   if (!response?.ok) {
     throw new Error(
       `no SodaMem daemon at ${DAEMON_URL}. Start it first — see test-integration/README.md`
     );
+  }
+
+  // Warm the daemon explicitly before ANY assertion.
+  //
+  // The daemon opens a user's store lazily, and that first request is slow and
+  // currently panics (see src/warmup.ts). Leaving it to chance made this suite
+  // pass warm and fail cold on its flagship recall assertion — a gate that
+  // cries wolf is worse than no gate, so the state is established here rather
+  // than depended upon.
+  const statuses: number[] = [];
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const status = await probe("integration suite warm-up");
+    statuses.push(status);
+    if (status === 200) break;
+  }
+  // eslint-disable-next-line no-console
+  console.log(`[suite] daemon warm-up statuses: ${statuses.join(", ")}`);
+  if (statuses[statuses.length - 1] !== 200) {
+    throw new Error(`daemon at ${DAEMON_URL} never became ready: ${statuses.join(", ")}`);
   }
 });
 
@@ -125,6 +159,29 @@ describe("recall reaches the model", () => {
   }, 60_000);
 });
 
+describe("the plugin warms the path when it loads", () => {
+  it("issues a warm-up request before any turn, so the first question is not the first request", async () => {
+    const proxy = await startRecordingProxy(DAEMON_URL);
+    const runtime = await bootRuntime(config(proxy.url));
+    try {
+      // Give the fire-and-forget warm-up room to land. Nothing waits on it in
+      // production either — that is the point.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const warmups = proxy.requests.filter((r) => r.path.includes(WARMUP_QUERY_ENCODED));
+      // eslint-disable-next-line no-console
+      console.log(`[warm-up] ${warmups.length} request(s) before the first turn`);
+      expect(warmups.length).toBeGreaterThanOrEqual(1);
+
+      // And the turn that follows still recalls for its own question.
+      await runtime.ask(PET_QUERY);
+      expect(runtime.adapter.topEvidence(0)).toContain(PET_EVIDENCE);
+    } finally {
+      await runtime.dispose();
+      await proxy.close();
+    }
+  }, 60_000);
+});
+
 describe("recall costs one request per question", () => {
   it("does not re-ask the daemon on every step of a tool loop", async () => {
     // A real proxy in front of the real daemon, purely to count wire traffic.
@@ -136,7 +193,9 @@ describe("recall costs one request per question", () => {
       runtime.adapter.script = [toolCallReply("call-1", PING_TOOL), textReply("done")];
       await runtime.ask(PET_QUERY);
 
-      const recalls = proxy.requests.filter((r) => r.path.startsWith("/v1/context"));
+      const recalls = proxy.requests.filter(
+        (r) => r.path.startsWith("/v1/context") && !r.path.includes(WARMUP_QUERY_ENCODED)
+      );
       report(`tool loop (${recalls.length} recall requests)`, runtime.adapter);
 
       // Two model requests in one turn...

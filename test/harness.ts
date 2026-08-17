@@ -11,6 +11,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { ContentBlock } from "@deepseek-ai/dsh-llm";
 import type { PromptAssembly } from "@deepseek-ai/dsh-system-prompt";
 import type { SodaMemConfig } from "../src/config.js";
+import { WARMUP_QUERY } from "../src/warmup.js";
 
 export const CONFIG: SodaMemConfig = {
   apiUrl: "http://127.0.0.1:8000",
@@ -29,7 +30,16 @@ export interface RecordedCall {
 }
 
 export interface FetchDouble {
+  /** Every recorded call, warm-up included. */
   calls: RecordedCall[];
+  /**
+   * Calls that are not the plugin's load-time warm-up.
+   *
+   * `apply()` fires a warm-up request so the user's first question is not the
+   * one that pays for the daemon's lazy store open. It is fire-and-forget, so
+   * assertions about recall traffic must exclude it rather than race it.
+   */
+  readonly recallCalls: RecordedCall[];
   restore(): void;
 }
 
@@ -66,6 +76,11 @@ export function installFetch(
   (globalThis as { fetch?: unknown }).fetch = impl;
   return {
     calls,
+    get recallCalls() {
+      return calls.filter(
+        (call) => new URL(call.url, "http://x").searchParams.get("query") !== WARMUP_QUERY
+      );
+    },
     restore() {
       (globalThis as { fetch?: unknown }).fetch = original;
     },
@@ -207,11 +222,21 @@ export function emptyAssembly(): PromptAssembly {
 
 /** Deliver one `agent/inbox/claimed` event, the way the loop does while claiming. */
 export function claim(fake: FakeContext, agentId: string, ...texts: string[]): void {
+  for (const text of texts) {
+    claimFrom(fake, agentId, { kind: "user" }, text);
+  }
+}
+
+/** Deliver a claimed message from an arbitrary source (injection, steering, a plugin). */
+export function claimFrom(
+  fake: FakeContext,
+  agentId: string,
+  source: { kind: string } | undefined,
+  text: string
+): void {
   const listener = fake.listeners.get("agent/inbox/claimed") as unknown as (p: unknown) => void;
   if (!listener) throw new Error("no agent/inbox/claimed listener registered");
-  for (const text of texts) {
-    listener({ agent: { id: agentId }, message: { content: textBlocks(text) } });
-  }
+  listener({ agent: { id: agentId }, message: { content: textBlocks(text), source } });
 }
 
 /**

@@ -107,11 +107,15 @@ Retain ingests only what a human or the model actually said. Tool results and th
 
 The one thing to know: when recall misses its deadline, the turn proceeds *without memory* and nothing surfaces to the user. The plugin logs a warning (`ctx.logger.warn`) on every degraded turn, and that log is the only signal you get. See the performance note below.
 
+On load the plugin also issues a couple of cheap warm-up requests, so the daemon's lazy store open — currently ~435 ms *and* an HTTP 500 — is paid before your first question instead of by it. Nothing waits on that warm-up, and it is harmless when no daemon is running yet.
+
 ## Performance
 
 Measured on a real 1000-fact store (auth on, single-worker daemon, loopback, one machine). Full method, caveats, and reproduction steps: [`NOTES-latency.md`](NOTES-latency.md).
 
-- Single client, 200 sequential requests: **p50 183 ms, p99 471 ms**. That is what auto-injection adds to time-to-first-token. It is the zero-LLM path, so it does not grow with model spend.
+- **Cold start is the expensive one.** The daemon opens a user's store lazily, and across 10 real daemon restarts that first request took **p50 435 ms** and returned **HTTP 500 in 10 runs out of 10** — a Chroma panic in the lazy open. The plugin absorbs this with a fire-and-forget warm-up at load (`src/warmup.ts`), so the cost lands before the user's first question rather than on it. This is a daemon-side defect and should be fixed there too.
+- **Warm, steady state: p50 17 ms** (p95 39 ms). That is what auto-injection adds to time-to-first-token once the store is open. It is the zero-LLM path, so it does not grow with model spend.
+- **An earlier run of the same benchmark reported p50 183 ms / p99 471 ms and did not reproduce.** Both measurements are recorded in the notes rather than one replacing the other; the cause is not established, though the old figure matches today's *second* request (181.6 ms) almost exactly, which suggests the store handle was being re-opened. Do not quote a single warm number without reading the notes.
 - **Multi-client is the caveat.** The daemon runs one worker by design, and `/v1/context` latency grows near-linearly with concurrent clients. At 8 concurrent clients the slowest sampled request was already within 10% of the 1500 ms recall deadline.
 
 So: if a `dsh` turn, a Cursor hook, and a Claude Code hook all hit the same daemon, expect recall to start silently dropping. That is a property of the daemon's read path, not of this plugin — but auto-injection is what makes it reachable, by turning an occasional tool call into a per-turn one. The numbers behind this, including why the concurrency figures should be read as a shape rather than as precise milliseconds, are in `NOTES-latency.md`.

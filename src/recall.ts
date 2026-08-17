@@ -42,7 +42,10 @@ export interface PluginLogger {
 /** The subset of the `agent/inbox/claimed` payload recall reads. */
 export interface ClaimPayload {
   readonly agent: { readonly id: string };
-  readonly message: { readonly content?: readonly ContentBlock[] };
+  readonly message: {
+    readonly content?: readonly ContentBlock[];
+    readonly source?: { readonly kind?: string };
+  };
 }
 
 export interface RecallDeps {
@@ -69,7 +72,14 @@ export function capQuery(query: string): string {
 /**
  * The `agent/inbox/claimed` listener: remember what was just asked.
  *
- * It does no I/O and never throws — a failure here would surface inside the
+ * Only the human's own prose opens a batch. `agent.inject()` and
+ * `agent.steer()` are public, and injected messages are claimed like any
+ * other, so without this filter another plugin's injected context would
+ * recall on plugin-authored text AND retire the human's question for the rest
+ * of the turn. This is the same `source.kind` rule retain applies when
+ * choosing what to ingest — the two sides stay symmetric.
+ *
+ * It does no I/O and never throws: a failure here would surface inside the
  * loop's claim path.
  */
 export function createClaimListener(deps: Pick<RecallDeps, "cache" | "logger">) {
@@ -79,6 +89,7 @@ export function createClaimListener(deps: Pick<RecallDeps, "cache" | "logger">) 
     try {
       const agentId = payload?.agent?.id;
       if (!agentId) return;
+      if (payload.message?.source?.kind !== "user") return;
       cache.claim(agentId, renderTextBlocks(payload.message?.content));
     } catch (error) {
       logger.warn("sodamem could not read the claimed message; no memory this turn: %o", error);
@@ -100,18 +111,18 @@ export function createClaimListener(deps: Pick<RecallDeps, "cache" | "logger">) 
 export function createAssembleListener(deps: RecallDeps) {
   const { config, cache, logger } = deps;
 
-  async function warm(agentId: string, signal: AbortSignal | undefined): Promise<void> {
-    const query = cache.take(agentId);
-    if (query === undefined) return;
+  async function recall(agentId: string, signal: AbortSignal | undefined): Promise<void> {
+    const ticket = cache.take(agentId);
+    if (ticket === undefined) return;
     const response = await withSodaMem(config, RECALL_TIMEOUT_MS, signal, (client) =>
       client.context({
         user_id: config.userId,
-        query: capQuery(query),
+        query: capQuery(ticket.query),
         token_budget: config.tokenBudget,
       })
     );
     const text = typeof response?.text === "string" ? response.text : "";
-    cache.resolve(agentId, sanitizeContextText(text));
+    cache.resolve(agentId, ticket, sanitizeContextText(text));
   }
 
   return async function onAssemble(
@@ -125,7 +136,7 @@ export function createAssembleListener(deps: RecallDeps) {
 
     if (agentId) {
       try {
-        await warm(agentId, context.signal);
+        await recall(agentId, context.signal);
       } catch (error) {
         logger.warn("sodamem recall failed; continuing with no memory this turn: %o", error);
       }

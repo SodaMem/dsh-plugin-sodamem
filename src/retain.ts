@@ -65,6 +65,47 @@ export interface RetainPayload {
 export interface RetainDeps {
   readonly config: SodaMemConfig;
   readonly logger: PluginLogger;
+  readonly ledger: RetainLedger;
+}
+
+/**
+ * How much of each turn has already been ingested.
+ *
+ * `agent/turn-stopping` is not once-per-turn: the loop re-enters when a
+ * listener queues next-step work, and `collectTurnMessages` always slices from
+ * `turn/start`, so a second firing would re-send everything the first one
+ * already sent. Duplicate writes into a user's store are the worst kind of
+ * bug here — they are silent, they compound, and extraction turns each copy
+ * into more facts.
+ *
+ * Recording a COUNT rather than a "done" flag keeps the other half honest
+ * too: when a re-entered turn really did produce more prose, the tail still
+ * gets ingested, exactly once.
+ */
+export class RetainLedger {
+  private readonly sent = new Map<string, { turn: number; count: number }>();
+
+  /** How many of this turn's messages have already gone to SodaMem. */
+  sentCount(agentId: string, turn: number): number {
+    const entry = this.sent.get(agentId);
+    return entry !== undefined && entry.turn === turn ? entry.count : 0;
+  }
+
+  record(agentId: string, turn: number, count: number): void {
+    this.sent.set(agentId, { turn, count });
+  }
+
+  delete(agentId: string): void {
+    this.sent.delete(agentId);
+  }
+
+  clear(): void {
+    this.sent.clear();
+  }
+
+  get size(): number {
+    return this.sent.size;
+  }
 }
 
 function isTurnStart(event: RetainEvent, turn: number): boolean {
@@ -114,14 +155,23 @@ export function collectTurnMessages(session: RetainSession, turn: number): Messa
  * never waits on fact extraction. The job is deliberately not polled.
  */
 export function createRetainListener(deps: RetainDeps) {
-  const { config, logger } = deps;
+  const { config, logger, ledger } = deps;
 
   return async function onTurnStopping(payload: RetainPayload): Promise<void> {
     try {
       const agent = payload?.agent;
       if (!agent?.session) return;
-      const messages = collectTurnMessages(agent.session, payload.turn);
+      const collected = collectTurnMessages(agent.session, payload.turn);
+
+      // Send only what a previous firing for this same turn did not.
+      const alreadySent = ledger.sentCount(agent.id, payload.turn);
+      const messages = collected.slice(alreadySent);
       if (messages.length === 0) return;
+
+      // Recorded BEFORE the request: a retried or concurrent firing must not
+      // be able to send this slice twice, and a failed write is not worth
+      // re-sending blind — the turn is already over.
+      ledger.record(agent.id, payload.turn, collected.length);
 
       await withSodaMem(config, RETAIN_TIMEOUT_MS, payload.signal, (client) =>
         client.add({

@@ -20,7 +20,8 @@ import type {} from "@deepseek-ai/dsh-agent";
 import { RecallCache } from "./cache.js";
 import { Config, type SodaMemConfig } from "./config.js";
 import { createAssembleListener, createClaimListener, type PluginLogger } from "./recall.js";
-import { createRetainListener } from "./retain.js";
+import { RetainLedger, createRetainListener } from "./retain.js";
+import { startWarmup } from "./warmup.js";
 
 export { Config, type SodaMemConfig } from "./config.js";
 export {
@@ -29,9 +30,16 @@ export {
   MAX_QUERY_CHARS,
   CONTEXT_NAME,
 } from "./config.js";
-export { RecallCache, type RecallEntry } from "./cache.js";
+export { RecallCache, type RecallEntry, type RecallTicket } from "./cache.js";
 export { capQuery, createAssembleListener, createClaimListener } from "./recall.js";
-export { collectTurnMessages, createRetainListener } from "./retain.js";
+export { RetainLedger, collectTurnMessages, createRetainListener } from "./retain.js";
+export {
+  WARMUP_ATTEMPTS,
+  WARMUP_QUERY,
+  WARMUP_TIMEOUT_MS,
+  WARMUP_TOKEN_BUDGET,
+  startWarmup,
+} from "./warmup.js";
 export { renderTextBlocks, sanitizeContextText } from "./messages.js";
 export { createClient, withSodaMem, SodaMemDeadlineError } from "./client.js";
 
@@ -41,21 +49,40 @@ export const inject = ["systemPrompt"];
 
 export function apply(ctx: Context, config: SodaMemConfig): void {
   const cache = new RecallCache();
+  const ledger = new RetainLedger();
   const logger = ctx.logger as unknown as PluginLogger;
+
+  // Aborted on unload, so a warm-up in flight cannot outlive the plugin.
+  const unloading = new AbortController();
 
   const disposers: Array<() => unknown> = [
     ctx.on("agent/inbox/claimed", createClaimListener({ cache, logger })),
     ctx.on("system-prompt/assemble", createAssembleListener({ config, cache, logger })),
-    ctx.on("agent/turn-stopping", createRetainListener({ config, logger })),
+    ctx.on("agent/turn-stopping", createRetainListener({ config, logger, ledger })),
     ctx.on("agent/disposed", (payload) => {
-      cache.delete(payload.agent.id);
+      // The only listener the harness gives no failure isolation of its own.
+      try {
+        const agentId = payload?.agent?.id;
+        if (!agentId) return;
+        cache.delete(agentId);
+        ledger.delete(agentId);
+      } catch (error) {
+        logger.warn("sodamem could not evict the disposed agent: %o", error);
+      }
     }),
   ];
 
-  // Every registration is released on unload, in reverse order, and the cache
+  // Started, never awaited: the daemon opens a store lazily, and the first
+  // request to touch it is slow and currently fails outright. Paying that here
+  // means the user's first question does not.
+  startWarmup({ config, logger, signal: unloading.signal });
+
+  // Every registration is released on unload, in reverse order, and the state
   // goes with them — nothing survives the fiber.
   ctx.effect(() => () => {
+    unloading.abort();
     for (const dispose of disposers.splice(0).reverse()) dispose();
     cache.clear();
+    ledger.clear();
   }, "dsh-plugin-sodamem");
 }

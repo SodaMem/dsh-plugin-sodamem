@@ -29,6 +29,29 @@ npm run test:integration
 Point it elsewhere with `SODAMEM_TEST_URL`, `SODAMEM_TEST_KEY`,
 `SODAMEM_TEST_USER` (defaults: `http://127.0.0.1:8771`, `benchkey`, `bench`).
 
+The suite **warms the daemon in `beforeAll`** before any assertion runs. That is
+not politeness: the daemon opens a user's store lazily, and that first request
+is slow and currently returns HTTP 500 (see `NOTES-latency.md`). Leaving it to
+chance made this suite pass against a warm daemon and fail its flagship recall
+assertion against a cold one — and a gate that cries wolf gets shrugged off,
+which is how the ordering bug survived two reviews. The warm-up statuses are
+printed (`[suite] daemon warm-up statuses: 500, 200`) so the cold path stays
+visible rather than hidden.
+
+Cold behaviour is asserted **on purpose**, in its own file. `cold-start.integration.test.ts`
+restarts the daemon and then asks a real question, which is the sequence a new
+user actually performs. It needs to be able to restart the daemon, so it is
+opt-in and skips loudly otherwise:
+
+```sh
+SODAMEM_TEST_DAEMON_CWD=/path/to/SodaMem \
+SODAMEM_TEST_DATA_ROOT=/path/to/store \
+npm run test:integration
+```
+
+With the plugin's load-time warm-up removed, that test fails with
+`first-turn evidence: (none)`.
+
 The queries the tests use (`do I have a pet?`, `which airline did I fly to
 Boston?`) must return distinct evidence from the store, since telling one
 turn's recall from another's is the whole point of the recall tests.
@@ -44,6 +67,8 @@ turn's recall from another's is the whole point of the recall tests.
 | `bounds the whole call and completes the turn anyway` | the deadline covers the response body |
 | `issues POST /v1/memories to the real daemon on turn close` | retain really fires |
 | `sends the closed turn's authored prose, and never its own recall` | retain body is right, and cannot feed the store its own output |
+| `issues a warm-up request before any turn` | the plugin warms the path at load |
+| `the first question after a daemon restart still gets memory` (opt-in) | cold start does not silently cost the first turn its memory |
 
 ## History: the ordering bug this suite was built to find
 
