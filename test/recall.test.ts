@@ -4,6 +4,7 @@ import {
   CONFIG,
   assemble,
   claim,
+  claimFrom,
   contributedText,
   createFakeContext,
   installContextFetch,
@@ -58,7 +59,7 @@ describe("recall", () => {
     expect(assembly.contexts).toEqual([{ name: "sodamem", text: "remembered" }]);
     expect(nextCalled).toBe(true);
 
-    const url = new URL(fetchDouble.calls[0]!.url);
+    const url = new URL(fetchDouble.recallCalls[0]!.url);
     expect(url.pathname).toBe("/v1/context");
     expect(url.searchParams.get("query")).toBe("where do I live?");
     expect(url.searchParams.get("user_id")).toBe(CONFIG.userId);
@@ -104,7 +105,7 @@ describe("recall", () => {
 
     expect(text).toBe("");
     expect(nextCalled).toBe(true);
-    expect(fetchDouble.calls).toHaveLength(0);
+    expect(fetchDouble.recallCalls).toHaveLength(0);
   });
 
   it("contributes nothing on a diagnostics assembly, which carries no agent", async () => {
@@ -116,7 +117,7 @@ describe("recall", () => {
 
     expect(text).toBe("");
     expect(nextCalled).toBe(true);
-    expect(fetchDouble.calls).toHaveLength(0);
+    expect(fetchDouble.recallCalls).toHaveLength(0);
   });
 
   it("fires once per claimed batch, not once per assembly", async () => {
@@ -130,7 +131,7 @@ describe("recall", () => {
     expect((await assemble(fake, "agent-a")).text).toBe("remembered");
     expect((await assemble(fake, "agent-a")).text).toBe("remembered");
 
-    expect(fetchDouble.calls).toHaveLength(1);
+    expect(fetchDouble.recallCalls).toHaveLength(1);
   });
 
   it("joins every message of one claimed batch into a single query", async () => {
@@ -141,8 +142,8 @@ describe("recall", () => {
     claim(fake, "agent-a", "first", "second");
     await assemble(fake, "agent-a");
 
-    expect(fetchDouble.calls).toHaveLength(1);
-    expect(new URL(fetchDouble.calls[0]!.url).searchParams.get("query")).toBe("first\nsecond");
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+    expect(new URL(fetchDouble.recallCalls[0]!.url).searchParams.get("query")).toBe("first\nsecond");
   });
 
   it("unreachable SodaMem: the assembly proceeds and contributes ''", async () => {
@@ -200,7 +201,7 @@ describe("recall", () => {
     const controller = new AbortController();
     await turn(fake, "agent-a", "hello", controller.signal);
 
-    const signal = fetchDouble.calls[0]!.signal;
+    const signal = fetchDouble.recallCalls[0]!.signal;
     expect(signal).toBeDefined();
     expect(signal!.aborted).toBe(false);
     controller.abort();
@@ -214,7 +215,7 @@ describe("recall", () => {
 
     await turn(fake, "agent-a", "x".repeat(MAX_QUERY_CHARS * 3));
 
-    const query = new URL(fetchDouble.calls[0]!.url).searchParams.get("query") ?? "";
+    const query = new URL(fetchDouble.recallCalls[0]!.url).searchParams.get("query") ?? "";
     expect(query.length).toBe(MAX_QUERY_CHARS);
   });
 
@@ -259,6 +260,28 @@ describe("recall", () => {
     expect(sanitizeContextText("{{a}}")).not.toContain("{{");
     expect(sanitizeContextText("{{{{a}}}}")).not.toContain("{{");
     expect(sanitizeContextText("plain")).toBe("plain");
+  });
+
+  it("only the human's prose opens a batch: injected and steering context does not", async () => {
+    fetchDouble = installContextFetch("remembered");
+    const fake = createFakeContext();
+    apply(fake.ctx, CONFIG);
+
+    claim(fake, "agent-a", "do I have a pet?");
+    await assemble(fake, "agent-a");
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+
+    // `agent.inject()` is public, and injected messages are claimed like any
+    // other. Recalling on another plugin's prose would both ask the wrong
+    // question and retire the human's for the rest of the turn.
+    claimFrom(fake, "agent-a", { kind: "plugin" }, "injected plugin context");
+    claimFrom(fake, "agent-a", { kind: "tool" }, "tool chatter");
+    claimFrom(fake, "agent-a", undefined, "unattributed");
+    const { text } = await assemble(fake, "agent-a");
+
+    expect(fetchDouble.recallCalls).toHaveLength(1);
+    // The human's question still owns the turn.
+    expect(text).toBe("remembered");
   });
 
   it("a claim listener failure cannot escape into the loop's claim path", () => {

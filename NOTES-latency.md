@@ -80,12 +80,97 @@ the same six (the `QUERIES` array in `scripts/concurrency_probe.mjs`).
 | **p99** | **471.1** |
 | max | 596.4 |
 
-Read this as: auto-injection adds roughly 180 ms to time-to-first-token on a
-typical turn and about 470 ms at the tail. Noticeable, not disqualifying — and
-because `/v1/context` is the zero-LLM path, this cost does not grow with model
-spend.
+**These figures did not reproduce on re-measurement, and they describe a WARM
+daemon only. Both caveats are covered below — read [Cold start](#cold-start-the-first-request-is-the-expensive-one)
+and [Re-measurement](#re-measurement-the-sequential-table-did-not-reproduce)
+before quoting anything from this table.**
 
-**This table is the trustworthy absolute number in this file.**
+
+## Cold start: the first request is the expensive one
+
+Everything above measures a daemon that has already served a request for this
+user. That is not the state a new user's first turn meets.
+
+The daemon opens a user's store **lazily**, on the first request that touches
+it. Measured across **10 real daemon restarts**, each sampled from a fresh Node
+process so the TCP connect is included the way a newly loaded plugin pays it
+(`scripts/measure-cold-start.mjs`):
+
+| | first request after restart | second request | steady state (requests 3+) |
+|---|---|---|---|
+| n | 10 | 10 | 40 |
+| min | 420.2 ms | 162.6 ms | 15.6 ms |
+| **p50** | **435.3 ms** | **181.6 ms** | **17.1 ms** |
+| p95 | 838.3 ms | 220.4 ms | 38.8 ms |
+| max | 838.3 ms | 220.4 ms | 39.6 ms |
+| outcome | **HTTP 500, 10 runs out of 10** | 200 | 200 |
+
+The first request does not merely cost more — **it fails**. The lazy store open
+panics inside Chroma's Rust bindings:
+
+```
+File "server/stores.py", line 123, in get
+    mem = SodaMem.open(path, extractor=self._build_extractor())
+File "chromadb/api/rust.py", line 114, in start
+    self.bindings = chromadb_rust_bindings.Bindings(
+pyo3_runtime.PanicException: range start index 10 out of range for slice of length 9
+```
+
+This is a **daemon-side defect**, not a plugin one, and it deserves its own
+issue against SodaMem. It is also not hypothetical: the sequential benchmark
+script in this repo excludes "one warm-up request", and that exclusion is not
+enough — `measure-context-latency.mjs` itself crashes when pointed at a freshly
+restarted daemon.
+
+### What the plugin does about it
+
+`src/warmup.ts` issues a cheap `GET /v1/context` (`token_budget=100`) when the
+plugin loads, twice, fire-and-forget. The first attempt absorbs the panic, the
+second confirms the path is live. Nothing awaits it, it never throws, and it
+stops on unload — booting with no daemon at all is an ordinary way to start.
+
+The effect is verified end to end by the `cold start` integration test, which
+restarts the daemon and then asks a real question through the real runtime.
+With the warm-up removed, that test fails with `first-turn evidence: (none)`.
+
+**So: the cost is real, it is ~0.5 s plus a guaranteed failure, and the user's
+first turn no longer pays it — the plugin does, at load.**
+
+## Re-measurement: the sequential table did not reproduce
+
+Re-running the exact sequential benchmark — same script, same six queries, same
+`token_budget`, same store, same machine — produced numbers an order of
+magnitude faster than the ones published above:
+
+| metric | published | re-measured |
+|---|---|---|
+| p50 | 182.6 ms | **14.2 ms** |
+| p95 | 323 ms | 36.1 ms |
+| p99 | 471.1 ms | 56.1 ms |
+| max | 596.4 ms | 77.2 ms |
+
+Result caching was ruled out: 200 requests with **unique** query strings gave
+p50 15.4 ms, statistically the same as 200 repeats of six queries (p50 14.2 ms).
+
+**The cause has not been established**, so both measurements stand recorded
+rather than one quietly replacing the other.
+
+There is one strong lead. The published p50 of **182.6 ms** is almost exactly
+today's **second request** figure of **181.6 ms** (p50, n=10) — the request that
+completes the lazy store open. If the original 200-request run was somehow
+re-paying that open on each request (an idle eviction, a per-request lease, a
+store manager dropping the handle), every sample would sit at the
+second-request cost rather than the steady-state one, which is precisely the
+shape observed. That is a hypothesis, not a finding; confirming it means
+instrumenting the daemon's store manager.
+
+Until it is understood, treat `/v1/context` warm latency as "~17 ms p50 in
+steady state, ~180 ms p50 if the store handle is being re-opened", and treat
+the concurrency table below — taken in the same session as the published
+sequential figures — with the same suspicion.
+
+What is NOT in doubt, because it reproduced 10 times out of 10: the first
+request after a daemon start is ~0.5 s and fails.
 
 ## Concurrent — the `--workers 1` question
 
@@ -208,4 +293,11 @@ SODAMEM_USER_ID=<user_id> SODAMEM_QUERIES='where do I live?|where do I work now?
 # 4. Concurrency shape.
 SODAMEM_API_URL=http://127.0.0.1:8771 SODAMEM_API_KEY=<key> \
 SODAMEM_USER_ID=<user_id> node scripts/concurrency_probe.mjs
+
+# Cold start (restarts the daemon, so it needs a SodaMem checkout):
+SODAMEM_DAEMON_CWD=/path/to/SodaMem \
+SODAMEM_DATA_ROOT=<data_root> \
+SODAMEM_API_URL=http://127.0.0.1:8771 \
+SODAMEM_API_KEY=<key> SODAMEM_USER_ID=<user_id> \
+node scripts/measure-cold-start.mjs 10
 ```
