@@ -20,7 +20,9 @@
  *
  * So a daemon that answers 200 and then stalls mid-body would leave the
  * `await` pending with no deadline at all (undici's own `bodyTimeout` is 300s)
- * — inside `agent/pre-step`, and inside the awaited `agent/turn-stopping`.
+ * — inside the awaited `system-prompt/assemble`, where it would stall prompt
+ * assembly and so the whole turn, and inside the awaited
+ * `agent/turn-stopping`.
  * That is precisely the failure this plugin exists to prevent.
  *
  * The fix lives at the seam we already own. `withSodaMem()` arms a
