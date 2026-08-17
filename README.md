@@ -1,21 +1,44 @@
 # dsh-plugin-sodamem
 
-A standalone plugin for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (`dsh`) that wires in [SodaMem](https://github.com/SodaMem/SodaMem) as a persistent memory layer.
+Long-term memory for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), backed by [SodaMem](https://github.com/SodaMem/SodaMem).
 
-**New here?** SodaMem is an open-source long-term memory store for LLM agents: you ingest conversation turns into it and it extracts durable facts, then serves a prompt-ready evidence block back on demand. It runs as a local daemon. This repo is only the `dsh` plugin — the memory engine itself lives at [github.com/SodaMem/SodaMem](https://github.com/SodaMem/SodaMem), and you need it running for this plugin to do anything.
+- **Recall** — while a turn is being assembled, the plugin retrieves an evidence block for that turn's question and contributes it to the prompt. BM25 + vector + entity fusion, no model call.
+- **Retain** — when the turn closes, its messages are ingested back into the store.
 
-The plugin installs SodaMem as a **memory layer**, not as a tool in the model's tool bag.
+Neither is a tool call, so the model can't skip either one and neither costs tool-schema space.
 
-- **Recall** — while every turn is being assembled, the plugin fetches a prompt-ready evidence block from SodaMem and contributes it to that turn's prompt.
-- **Retain** — when every turn closes, the plugin ingests that turn's messages back into SodaMem.
+SodaMem is a separate open-source memory engine that runs as a local daemon. This repo is only the `dsh` plugin; you need the daemon running for it to do anything.
 
-Neither one is a tool call, so neither one depends on the model deciding to use it.
+## What you get that a notes file doesn't
+
+**Every recalled fact names the turn it came from.** This is one line of a real evidence block, verbatim:
+
+```
+support=I flew United to Boston last week.
+predicate=User flew United to Boston
+entities=airline=United|destination=Boston
+source=s4/s4_turn_0        ← the actual turn, not "some earlier chat"
+date=2023-06-10
+```
+
+`FactEvent → SourceSpan → RawTurn` is a foreign-key chain. When the model asserts something about the user, there is a row explaining why.
+
+**Facts expire.** SodaMem keeps four time axes — when the event happened, when the fact was true, when it was said, when it was stored. "I moved to Chicago last year" and "I'm moving next year" are different rows, and a fact that stopped being true stops coming back. Corrections are ADD-only: a new version plus a `SUPERSEDES` edge, never an in-place rewrite.
+
+**The engine is benchmarked and the answers are published.**
+
+| benchmark | score | |
+|---|---|---|
+| LongMemEval-S | 92.8% (464/500) | [500 answers + 8,427 evidence rows](https://github.com/SodaMem/SodaMem/tree/main/benchmarking/artifacts/), re-gradable with any judge |
+| LoCoMo | 86.88% (1338/1540) | end-to-end QA, LLM-as-judge |
+
+Those are SodaMem's numbers — the engine this plugin talks to, not the plugin itself.
 
 ## Why not the MCP bridge?
 
 SodaMem already has an MCP integration for `dsh`, in the main SodaMem repo ([`integrations/deepseek-harness/`](https://github.com/SodaMem/SodaMem/tree/main/integrations/deepseek-harness)). It exposes memory as **tools**, which means the model has to choose to call them — and on most turns it simply doesn't. The strongest thing SodaMem offers, the zero-LLM `GET /v1/context` evidence block, ends up left to the model's discretion.
 
-MCP cannot fix that. A tool is pull-only, and nothing in the protocol lets a server contribute to the prompt or observe a turn closing. This plugin uses the two seams the harness itself exposes — `agent/pre-step` and `agent/turn-stopping` — so recall and retain happen unconditionally.
+MCP cannot fix that. A tool is pull-only, and nothing in the protocol lets a server contribute to the prompt or observe a turn closing. This plugin uses the harness's own seams instead — `system-prompt/assemble` for recall and `agent/turn-stopping` for retain — so both happen unconditionally.
 
 | | MCP bridge | This plugin |
 |---|---|---|
