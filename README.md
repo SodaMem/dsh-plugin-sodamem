@@ -34,7 +34,16 @@ MCP cannot fix that. A tool is pull-only, and nothing in the protocol lets a ser
 ## Install
 
 ```bash
-npm install dsh-plugin-sodamem
+dsh plugin --profile tui add dsh-plugin-sodamem
+```
+
+That is all that is needed. The package ships a `dsh.bundle` manifest pointing
+at [`cordis.patch.yml`](./cordis.patch.yml), so `dsh` adds the plugin to the
+profile's bundle list and composes its row — with working defaults — into the
+profile tree. Confirm it landed:
+
+```bash
+dsh --profile tui --dump-config | grep -A6 'id: sodamem'
 ```
 
 Start the daemon first (once per machine):
@@ -47,25 +56,29 @@ Fact extraction needs LLM credentials on the **daemon** side. Put `SODAMEM_LLM_P
 
 ## Configure
 
-Load it with a `dsh` patch file, the same mechanism the MCP guide uses:
+The bundled `cordis.patch.yml` ships defaults that boot (`apiUrl`
+`http://127.0.0.1:8000`, `userId` `default`). To change them, override the row
+in **your own** profile `cordis.patch.yml`, which applies after every bundle
+layer:
 
 ```yaml
-# sodamem-plugin.patch.yml
-- insert:
-    - id: sodamem
-      name: dsh-plugin-sodamem
-      config:
-        apiUrl: 'http://127.0.0.1:8000'
-        apiKey: 'dev'
-        userId: 'your-user-id'
-        tokenBudget: 1200
+# $DSH_HOME/profiles/<profile>/cordis.patch.yml
+- id: sodamem
+  config:
+    apiUrl: 'http://127.0.0.1:8000'
+    apiKey: 'dev'
+    userId: 'your-user-id'
+    tokenBudget: 1200
 ```
+
+A patch **replaces** the targeted row's whole `config` rather than merging into
+it, so restate every key you want to keep.
+
+Without installing as a bundle, the same row can be inserted ad hoc:
 
 ```bash
 npx @deepseek-ai/dsh web --patch ./sodamem-plugin.patch.yml
 ```
-
-Or add the same `name` / `config` entry to your `cordis.yml`.
 
 ### Config fields
 

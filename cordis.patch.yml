@@ -1,0 +1,48 @@
+# dsh-plugin-sodamem bundle patch — SodaMem as the harness's memory layer.
+#
+# This is the layer `dsh plugin add dsh-plugin-sodamem` applies. It inserts one
+# plugin row; it targets no existing row, so it overrides nothing the profile
+# already configured. Layer order is the shipped bundles, then this patch, then
+# the user's own profile cordis.patch.yml — so anything set below can be
+# restated and overridden there.
+#
+# What the layer does, once loaded:
+#
+#   * Recall — every turn is assembled with whatever SodaMem knows, through
+#     `agent/inbox/claimed` plus the `system-prompt/assemble` waterfall. It is
+#     unconditional and bounded at 1500 ms; a slow or down daemon costs the
+#     turn its memory, never its answer.
+#   * Retain — every closed turn is ingested, through `agent/turn-stopping`,
+#     bounded at 5000 ms.
+#
+# Neither is a tool, so neither is left to the model's discretion. The row
+# needs no isolate realm: it publishes no service and only consumes the host's
+# `systemPrompt` registry.
+#
+# Remote only, by design. The plugin speaks HTTP to a running SodaMem daemon
+# and imports nothing that can open a store — two local writers on one
+# `SODAMEM_DATA_ROOT` corrupt it, and a plugin inside an arbitrary harness
+# process is the worst possible second writer. Start the daemon first:
+#
+#   sodamem daemon ensure --api-url http://127.0.0.1:8000
+#
+# Config note: a patch REPLACES a targeted row's whole `config` rather than
+# merging into it, so a later layer overriding this row must restate every key
+# it wants to keep.
+
+- insert:
+    - id: sodamem
+      name: dsh-plugin-sodamem
+      config:
+        # Origin of the running SodaMem daemon. Required — there is no local
+        # store fallback, on purpose (see above).
+        apiUrl: 'http://127.0.0.1:8000'
+        # Sent on every request. Any non-empty string works when the daemon
+        # runs with auth disabled; there is no magic fallback value.
+        apiKey: 'sodamem'
+        # The SodaMem `user_id` every read and write is scoped to. Change this
+        # to keep separate memory per person or per deployment.
+        userId: 'default'
+        # Token budget for the recalled evidence block handed to
+        # `GET /v1/context`. Larger recalls more, and costs more prompt.
+        tokenBudget: 1200
