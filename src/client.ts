@@ -111,6 +111,11 @@ export async function withSodaMem<T>(
 ): Promise<T> {
   const deadline = new AbortController();
   const timer = setTimeout(() => deadline.abort(new SodaMemDeadlineError(timeoutMs)), timeoutMs);
+  // Warm-up is fire-and-forget, so this timer can be the last thing on the
+  // loop; without unref a stalling daemon holds a short-lived host process
+  // open for the whole deadline. `unref` is Node-only — browser-style timers
+  // return a number — so the capability is checked, not assumed.
+  (timer as { unref?: () => void }).unref?.();
   try {
     const client = createClient(config, timeoutMs, turnSignal, deadline.signal);
     return await Promise.race([call(client), rejectOnAbort(deadline.signal)]);
