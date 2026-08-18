@@ -4,25 +4,27 @@
  *
  * The daemon opens a user's store LAZILY, on the first request that touches it
  * — connecting to Chroma, loading the BM25 index. Measured on a real 1000-fact
- * store across 8 daemon restarts, that first request cost 426–773 ms and
- * failed outright every single time:
+ * store across 3 daemon restarts, that first request costs about 5x steady
+ * state:
  *
  * ```
- * File "server/stores.py", line 123, in get
- *   mem = SodaMem.open(path, extractor=self._build_extractor())
- * File "chromadb/api/rust.py", line 114, in start
- *   self.bindings = chromadb_rust_bindings.Bindings(
- * pyo3_runtime.PanicException: range start index 10 out of range for slice of length 9
+ * round 1: cold 880ms status=200  then 152/134/127/125/182ms
+ * round 2: cold 633ms status=200  then 136/129/136/126/136ms
+ * round 3: cold 619ms status=200  then 135/128/130/129/138ms
  * ```
  *
- * The SECOND request succeeds (140–242 ms), and every one after that is
- * 14–48 ms. So without this, a stranger installs the plugin, asks their first
- * question, and silently gets no memory — the designed degrade working
- * perfectly on a cost nobody warned them about.
+ * It SUCCEEDS — 200 in 3 restarts out of 3, full vector routes — and the
+ * second request is already at steady state. So this is a one-time store-open
+ * cost, and the only question is who pays it: the plugin at load, or the user
+ * on their first question.
  *
- * This is a daemon-side defect and it should be fixed there too; absorbing it
- * here is not a substitute for that. But the plugin is the side that knows
- * when it is about to be used, so it is the side that can pay the cost early.
+ * RETRACTION. This comment previously justified the warm-up by claiming the
+ * first request "failed outright every single time" with a
+ * `pyo3_runtime.PanicException` out of Chroma's Rust bindings. That was an
+ * artifact of the measurement machine — a store schema-migrated by one
+ * chromadb version and then read by an older one — not a daemon defect, and it
+ * is withdrawn. See NOTES-latency.md. The latency justification survived
+ * re-measurement; the failure justification did not.
  *
  * Contract, all three load-bearing:
  * - it never blocks `apply()` — the work is started, never awaited;
@@ -42,9 +44,10 @@ import type { PluginLogger } from "./recall.js";
 export const WARMUP_TIMEOUT_MS = 10_000;
 
 /**
- * Two attempts, because one is not enough: the first request is the one that
- * triggers the lazy store open, and that is the one that panics. The second
- * both confirms the path is live and leaves it hot.
+ * One request is enough to open the store — measurement shows the request
+ * after the cold one is already at steady state. The second attempt is an
+ * ordinary retry, taken ONLY if the first fails: a daemon still binding its
+ * port, or a transient error. On the happy path exactly one request is sent.
  */
 export const WARMUP_ATTEMPTS = 2;
 
@@ -85,8 +88,8 @@ export function startWarmup(deps: WarmupDeps): void {
         logger.debug("sodamem warm-up succeeded on attempt %d; recall is hot", attempt);
         return;
       } catch (error) {
-        // Entirely expected when no daemon is running yet, and expected on
-        // attempt 1 against a daemon that has not opened this store before.
+        // Entirely expected when no daemon is running yet — booting before the
+        // daemon is an ordinary way to start.
         logger.debug("sodamem warm-up attempt %d did not succeed: %o", attempt, error);
       }
     }

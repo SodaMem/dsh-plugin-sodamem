@@ -73,8 +73,8 @@ export function apply(ctx: Context, config: SodaMemConfig): void {
   ];
 
   // Started, never awaited: the daemon opens a store lazily, and the first
-  // request to touch it is slow and currently fails outright. Paying that here
-  // means the user's first question does not.
+  // request to touch it costs ~5x steady state (~630 ms against ~130 ms).
+  // Paying that here means the user's first question does not.
   startWarmup({ config, logger, signal: unloading.signal });
 
   // Every registration is released on unload, in reverse order, and the state

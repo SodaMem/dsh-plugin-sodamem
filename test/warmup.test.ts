@@ -49,7 +49,7 @@ describe("warm-up", () => {
     expect(() => apply(fake.ctx, CONFIG)).not.toThrow();
   });
 
-  it("retries once, because the request that opens the store is the one that fails", async () => {
+  it("retries once when the first request fails, so a daemon still coming up is not fatal", async () => {
     let attempts = 0;
     fetchDouble = installFetch(() => {
       attempts++;

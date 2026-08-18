@@ -3,9 +3,20 @@
  * Measure the COLD `/v1/context` cost: the first request after a daemon start.
  *
  * The daemon opens a user's store lazily, so the first request that touches it
- * pays for that open — and currently fails while doing so. Everything in
- * `measure-context-latency.mjs` describes the warm path; this script describes
- * the path a new user's first turn actually meets.
+ * pays for that open. Everything in `measure-context-latency.mjs` describes the
+ * warm path; this script describes the path a new user's first turn actually
+ * meets.
+ *
+ * It reports the cold status alongside the cold latency because an earlier
+ * measurement claimed the cold request always FAILED (HTTP 500, Chroma panic).
+ * That claim is withdrawn — it was a chromadb version mismatch on the test
+ * machine, see NOTES-latency.md. On a consistent chromadb the cold request
+ * returns 200; it just costs ~5x steady state.
+ *
+ * Pin the interpreter before running this: put the SodaMem venv's `bin` first
+ * on PATH, because `sodamem daemon ensure` resolves `uvicorn` from PATH and a
+ * second Python with a different chromadb is what produced the withdrawn
+ * numbers.
  *
  * Two details are load-bearing, and both were wrong in the first attempt:
  *
