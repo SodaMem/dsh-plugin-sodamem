@@ -96,11 +96,17 @@ beforeAll(async () => {
 
   // Warm the daemon explicitly before ANY assertion.
   //
-  // The daemon opens a user's store lazily, and that first request is slow and
-  // currently panics (see src/warmup.ts). Leaving it to chance made this suite
-  // pass warm and fail cold on its flagship recall assertion — a gate that
-  // cries wolf is worse than no gate, so the state is established here rather
-  // than depended upon.
+  // The daemon opens a user's store lazily, and that first request is ~5x the
+  // steady-state cost (see src/warmup.ts). Leaving it to chance made this
+  // suite pass warm and fail cold on its flagship recall assertion — a gate
+  // that cries wolf is worse than no gate, so the state is established here
+  // rather than depended upon.
+  //
+  // The loop tolerates a non-200 rather than requiring one: an earlier version
+  // of this comment asserted the first request always returns 500 from a
+  // Chroma panic. That was a measurement-machine artifact and is withdrawn
+  // (see NOTES-latency.md); on a consistent chromadb the first request
+  // succeeds.
   const statuses: number[] = [];
   for (let attempt = 0; attempt < 5; attempt++) {
     const status = await probe("integration suite warm-up");

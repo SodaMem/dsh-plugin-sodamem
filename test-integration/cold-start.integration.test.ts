@@ -53,8 +53,9 @@ describe.skipIf(!enabled)("cold start", () => {
 
     // A stranger's sequence exactly: the daemon is cold, the plugin loads, and
     // then they ask. Without the load-time warm-up the first request is the one
-    // that opens the store — which is slow and currently panics — so this turn
-    // silently got no memory at all.
+    // that opens the store — measured at ~630 ms against a ~130 ms steady
+    // state — so this turn pays that cost, and pays it against the recall
+    // deadline.
     const runtime = await bootRuntime({
       apiUrl: DAEMON_URL,
       apiKey: DAEMON_KEY,

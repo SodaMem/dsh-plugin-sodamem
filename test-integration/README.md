@@ -31,16 +31,23 @@ Point it elsewhere with `SODAMEM_TEST_URL`, `SODAMEM_TEST_KEY`,
 
 The suite **warms the daemon in `beforeAll`** before any assertion runs. That is
 not politeness: the daemon opens a user's store lazily, and that first request
-is slow and currently returns HTTP 500 (see `NOTES-latency.md`). Leaving it to
-chance made this suite pass against a warm daemon and fail its flagship recall
-assertion against a cold one — and a gate that cries wolf gets shrugged off,
-which is how the ordering bug survived two reviews. The warm-up statuses are
-printed (`[suite] daemon warm-up statuses: 500, 200`) so the cold path stays
-visible rather than hidden.
+costs roughly 5x steady state (~630 ms against ~130 ms, see `NOTES-latency.md`).
+Leaving it to chance made this suite pass against a warm daemon and fail its
+flagship recall assertion against a cold one — and a gate that cries wolf gets
+shrugged off, which is how the ordering bug survived two reviews. The warm-up
+statuses are printed (`[suite] daemon warm-up statuses: 200`) so the cold path
+stays visible rather than hidden.
+
+**Retraction:** this file previously said that first request "currently returns
+HTTP 500". It does not. That was a measurement-machine artifact — a chroma
+store schema-migrated by chromadb 1.5.8 and then read by 1.1.1 — and it is
+withdrawn in `NOTES-latency.md`. The `beforeAll` loop tolerates a non-200 and
+retries; it never required one.
 
 Cold behaviour is asserted **on purpose**, in its own file. `cold-start.integration.test.ts`
 restarts the daemon and then asks a real question, which is the sequence a new
-user actually performs. It needs to be able to restart the daemon, so it is
+user actually performs. It asserts that the first turn still gets its memory —
+it does not assert any failure mode. It needs to be able to restart the daemon, so it is
 opt-in and skips loudly otherwise:
 
 ```sh
@@ -68,7 +75,7 @@ turn's recall from another's is the whole point of the recall tests.
 | `issues POST /v1/memories to the real daemon on turn close` | retain really fires |
 | `sends the closed turn's authored prose, and never its own recall` | retain body is right, and cannot feed the store its own output |
 | `issues a warm-up request before any turn` | the plugin warms the path at load |
-| `the first question after a daemon restart still gets memory` (opt-in) | cold start does not silently cost the first turn its memory |
+| `the first question after a daemon restart still gets memory` (opt-in) | cold start's ~630 ms store open does not cost the first turn its memory |
 
 ## History: the ordering bug this suite was built to find
 
