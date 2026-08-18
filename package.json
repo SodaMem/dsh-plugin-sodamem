@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-sodamem",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "SodaMem memory layer for the DeepSeek Harness (Cordis): unconditional per-turn recall and per-turn-close retain.",
   "license": "Apache-2.0",
   "type": "module",
@@ -23,6 +23,8 @@
     "dist",
     "cordis.patch.yml",
     "README.md",
+    "NOTES-latency.md",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE"
   ],

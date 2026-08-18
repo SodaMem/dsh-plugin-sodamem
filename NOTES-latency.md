@@ -26,8 +26,17 @@ this file.**
 ## RETRACTION (2026-08-18) — the cold-start finding and the warm p50 are withdrawn
 
 **Two published claims in this file were wrong, and they were wrong for the
-same reason. Nothing below this heading has been deleted: the withdrawn figures
-stay visible, marked, so anyone who quoted them can see what happened.**
+same reason.**
+
+**No withdrawn FIGURE has been deleted** — every retracted number stays below,
+struck through and labelled, so anyone who quoted one can see what happened.
+**Some withdrawn PROSE was rewritten in place rather than struck through:** the
+sentence claiming the integration test gated the warm-up, the "how firm is that
+margin" paragraph under the operational consequence, and the original
+absolute-milliseconds caveat under the concurrency table. Each of those is
+called out at the point where it was changed, but the old wording is in git
+history rather than on this page. If you are checking a quotation against this
+file and cannot find it, check `git log -p NOTES-latency.md`.
 
 ### What was withdrawn
 
@@ -285,8 +294,17 @@ pay that. The warm-up makes it the plugin's cost at load rather than the user's
 cost on their first question. It retries once, but as an ordinary retry for a
 transient failure, not because attempt 1 is expected to fail.
 
-The effect is verified end to end by the `cold start` integration test, which
-restarts the daemon and then asks a real question through the real runtime.
+**The `cold start` integration test no longer gates this, and this file used to
+claim it did.** The withdrawn version said the effect was "verified end to end"
+by that test, and that was true only while the cold request was believed to
+fail: with the warm-up removed, the first turn got no memory at all. On the
+corrected facts a ~630 ms cold request comfortably clears the 1500 ms recall
+deadline, so **that test would now pass with `src/warmup.ts` deleted.** It is
+still a real test — it restarts the daemon and asserts actual evidence content
+through the real runtime — but it proves that cold start does not cost the
+first turn its memory, not that the warm-up is what prevents that. **The
+warm-up's justification is a latency measurement, and nothing in the test suite
+currently holds it in place.**
 
 ## Re-measurement: RESOLVED — the two runs were measuring different stores
 
@@ -373,6 +391,14 @@ concurrency=8  n=40  p50=671.6ms  worst=731.8ms
 It still queues, roughly linearly. The **shape** is the finding that survived
 the retraction unchanged; only the absolute numbers moved.
 
+**These two runs were taken on an otherwise idle machine.** An independent
+re-measurement on the same store on a loaded machine (load avg 14) ran the
+probe five times and got worst-of-40 at concurrency 8 of
+**986 / 1101 / 1121 / 1178 / 1268 ms** — consistent with the table once
+you account for the ~1.5x that machine also cost on the sequential harness, but
+a reminder that the table's absolute milliseconds are a property of a quiet
+box. See [Operational consequence](#operational-consequence--state-this-plainly).
+
 ### Withdrawn (do not quote)
 
 | concurrency | n | median ms | worst-of-n ms |
@@ -403,12 +429,15 @@ one.
 
 ### Caveat — do not read these as absolute milliseconds
 
-The probe's numbers still run somewhat **higher** than the 200-iteration
-sequential harness at equivalent load: 128 ms median at concurrency 1 against
-130.2 ms sequential p50 — which on the clean store is now close agreement
-rather than the ~1.9x gap the withdrawn table showed. Five rounds do not warm
-the BM25 index cache the way 200 sequential requests do; run 1 above (166 ms at
-concurrency 1) shows that cost, and run 2 shows it going away.
+On the clean store the probe and the sequential harness now **agree** at
+concurrency 1 — 128.4 ms probe median against 130.2 ms sequential p50 — where
+the withdrawn table showed the probe reading ~1.9x high. That agreement is the
+warm case, and it is not guaranteed: run 1 above, taken immediately after
+daemon start, read 166.1 ms at the same level, because five rounds do not warm
+the BM25 index cache the way 200 sequential requests do. So the probe reads
+**high when cold and level when warm**, which is a smaller and better-behaved
+error than the withdrawn text described — but it is still an error, and it is
+still why the absolute milliseconds here should not be quoted on their own.
 
 The reliable output of the probe is the **shape** — near-linear queueing under
 concurrency. For absolute latency, use the corrected sequential figure.
@@ -437,20 +466,38 @@ Withdrawn: *"At concurrency 8, the slowest of 40 requests took 1379 ms — insid
 10% of the plugin's 1500 ms recall deadline."* That came from the contaminated
 store.
 
-Re-measured: at concurrency 8, the slowest of 40 requests took **731.8 ms**,
-and the median at that level was **671.6 ms**. Against the plugin's 1500 ms
-recall deadline that is a margin of roughly **2x**, not 10%.
+Re-measured on an otherwise idle machine: at concurrency 8, the slowest of 40
+requests took **731.8 ms**, median **671.6 ms** — a margin of roughly **2x**
+against the 1500 ms deadline, not 10%.
 
-So the honest statement is weaker than the one published: at 8 concurrent
-clients on this store and this machine, recall clears the deadline with room to
-spare. Nothing measured here shows recall missing its deadline.
+**That 2x is the quiet-machine best case, and quoting it alone would be the
+same mistake in the other direction.** An independent re-measurement on the
+same store, on a *loaded* machine (load avg 14, sequential p50 196.8 ms against
+this file's 130.2 ms), ran the probe five times and got worst-of-40 at
+concurrency 8 of:
+
+```
+986 / 1101 / 1121 / 1178 / 1268 ms
+```
+
+That is a **1.2x–1.5x** margin, with the worst run inside 16% of the deadline.
+Scaled by the ~1.5x the loaded machine costs on the sequential harness too,
+those runs are consistent with 731.8 ms rather than a refutation of it — the
+two measurements agree about the machine, not about a headline number.
+
+So the honest statement is: **at 8 concurrent clients there is real headroom on
+the deadline, somewhere between roughly 1.2x and 2x depending on what else the
+box is doing.** That is meaningfully better than the withdrawn "within 10%",
+and it is not "recall is safe at 8 clients". Nothing measured on either machine
+shows recall actually missing its deadline; the loaded machine shows how little
+it would take.
 
 What is *not* softened is the direction and the shape: latency grows
 near-linearly with concurrent clients (128 → 211 → 361 → 672 ms median at 1, 2,
-4, 8), and the deadline is a fixed 1500 ms. Extrapolating the same slope, the
-deadline comes into reach somewhere around 16 concurrent clients — but that is
-an extrapolation, not a measurement, and it is labelled as one. The probe was
-not run past 8.
+4, 8), and the deadline is a fixed 1500 ms. Extrapolating the same slope on the
+idle machine, the deadline comes into reach somewhere around 16 concurrent
+clients; on the loaded machine, closer to 10. Both are extrapolations, not
+measurements, and are labelled as such. The probe was not run past 8 on either.
 
 When recall does drop, the plugin does the safe thing: it caches `''`,
 contributes no memory, and the turn proceeds normally. Nothing breaks and
